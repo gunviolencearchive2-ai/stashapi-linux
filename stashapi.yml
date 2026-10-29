@@ -1,0 +1,16 @@
+name: "Stash API"
+description: "Official plugin API for Stash"
+version: "2.4.4"
+
+ui:
+  javascript:
+    - app.js
+  assets:
+    /: assets
+
+exec:
+  - sh
+  - "{pluginDir}/bootstrap.sh"
+
+interface: raw
+errLog: none

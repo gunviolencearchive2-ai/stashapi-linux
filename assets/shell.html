@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Remote Shell</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #12141a; color: #dcdfe6;
+               font: 13px/1.45 Consolas, "Cascadia Mono", Menlo, monospace; }
+  body { display: flex; flex-direction: column; }
+  #bar { display: flex; align-items: center; gap: 10px; padding: 6px 10px;
+         background: #1b1e26; border-bottom: 1px solid #2b2f3a; flex: none; }
+  #cwd { color: #98c379; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #status { margin-left: auto; color: #5c6370; }
+  #status.busy { color: #e5c07b; }
+  #status.err { color: #e06c75; }
+  button { background: #2b2f3a; color: #dcdfe6; border: 1px solid #3a4050;
+           border-radius: 4px; padding: 3px 10px; cursor: pointer; font: inherit; }
+  button:hover { background: #363b48; }
+  #term { flex: 1; overflow-y: auto; padding: 10px; white-space: pre-wrap;
+          word-break: break-word; }
+  #term .cmd { color: #61afef; }
+  #term .err { color: #e06c75; }
+  #term .meta { color: #5c6370; }
+  #inputline { display: flex; gap: 8px; padding: 6px 10px; background: #1b1e26;
+               border-top: 1px solid #2b2f3a; flex: none; }
+  #prompt { color: #98c379; white-space: pre; }
+  #cmd { flex: 1; background: transparent; border: 0; outline: 0; color: #dcdfe6; font: inherit; }
+  .b { font-weight: 700; }
+  .c30{color:#5c6370}.c31{color:#e06c75}.c32{color:#98c379}.c33{color:#e5c07b}
+  .c34{color:#61afef}.c35{color:#c678dd}.c36{color:#56b6c2}.c37{color:#dcdfe6}
+  .c90{color:#5c6370}.c91{color:#e06c75}.c92{color:#98c379}.c93{color:#e5c07b}
+  .c94{color:#61afef}.c95{color:#c678dd}.c96{color:#56b6c2}.c97{color:#ffffff}
+  .bg40{background:#1b1e26}.bg41{background:#3b2b2b}.bg42{background:#243024}
+  .bg43{background:#3a3524}.bg44{background:#22303f}.bg45{background:#332842}
+  .bg46{background:#223234}.bg47{background:#2b2f3a}
+</style>
+</head>
+<body>
+<div id="bar">
+  <span id="cwd">…</span>
+  <span id="status">подключение…</span>
+  <button id="reset">сброс папки</button>
+  <button id="clear">clear</button>
+</div>
+<div id="term"></div>
+<div id="inputline">
+  <span id="prompt">C:\&gt;</span>
+  <input id="cmd" autocomplete="off" spellcheck="false" autofocus>
+</div>
+<script>
+const PLUGIN = location.pathname.split('/')[2] || 'stashapi';
+const QUERY = 'mutation($p:ID!,$a:Map!){runPluginOperation(plugin_id:$p,args:$a)}';
+
+function parseRes(r) {
+  if (r && typeof r === 'object') return r;
+  var s = String(r ?? '');
+  var i = s.search(/[{[]/);
+  if (i > 0) {
+    try { return JSON.parse(s.slice(i)); } catch (e) { /* ignore */ }
+  }
+  try { return JSON.parse(s); } catch (e) { /* ignore */ }
+  return { output: s };
+}
+
+const TIMEOUT = 600;
+
+const term = document.getElementById('term');
+const input = document.getElementById('cmd');
+const cwdEl = document.getElementById('cwd');
+const promptEl = document.getElementById('prompt');
+const statusEl = document.getElementById('status');
+
+let cwd = localStorage.getItem('stashapi_cwd') || '';
+let history = [];
+try { history = JSON.parse(localStorage.getItem('stashapi_hist') || '[]'); } catch (e) { history = []; }
+let hidx = history.length;
+
+const queue = [];
+let busy = false;
+let controller = null;
+
+function setStatus(t, cls) { statusEl.textContent = t; statusEl.className = cls || ''; }
+
+function setCwd(p) {
+  cwd = p;
+  localStorage.setItem('stashapi_cwd', p);
+  cwdEl.textContent = p;
+  promptEl.textContent = p.replace(/[\\/]+$/, '') + '>';
+}
+
+function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+function ansiToHtml(text) {
+  text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const parts = text.split(/\x1b\[([0-9;]*)m/);
+  let cls = [], html = '';
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 1) {
+      parts[i].split(';').filter(Boolean).map(Number).forEach(function (c) {
+        if (c === 0) cls = [];
+        else if (c === 1) cls.push('b');
+        else if (c === 22) cls = cls.filter(function (x) { return x !== 'b'; });
+        else if (c >= 30 && c <= 37) cls = cls.filter(function (x) { return !/^c3\d$/.test(x); }).concat('c' + c);
+        else if (c >= 90 && c <= 97) cls = cls.filter(function (x) { return !/^c9\d$/.test(x); }).concat('c' + c);
+        else if (c >= 40 && c <= 47) cls = cls.filter(function (x) { return !/^bg4\d$/.test(x); }).concat('bg' + c);
+      });
+    } else {
+      const t = esc(parts[i].replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\x1b/g, ''));
+      if (t) html += cls.length ? '<span class="' + cls.join(' ') + '">' + t + '</span>' : t;
+    }
+  }
+  return html;
+}
+
+function write(html, cls) {
+  const d = document.createElement('div');
+  if (cls) d.className = cls;
+  d.innerHTML = html;
+  term.appendChild(d);
+  term.scrollTop = term.scrollHeight;
+}
+
+async function op(args, signal) {
+  const r = await fetch('/graphql', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ query: QUERY, variables: { p: PLUGIN, a: args } }),
+    signal: signal,
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const j = await r.json();
+  if (j.errors && j.errors.length) throw new Error(j.errors.map(function (e) { return e.message; }).join('; '));
+  return parseRes(j.data.runPluginOperation);
+}
+
+function submit(line) {
+  queue.push(line);
+  if (queue.length > 1) setStatus('в очереди: ' + (queue.length - 1), 'busy');
+  if (!busy) drain();
+}
+
+async function drain() {
+  busy = true;
+  while (queue.length) {
+    await run(queue.shift());
+  }
+  busy = false;
+  setStatus('готово');
+}
+
+async function run(line) {
+  write(esc(promptEl.textContent) + ' ' + esc(line), 'cmd');
+  if (!line.trim()) return;
+
+  controller = new AbortController();
+  setStatus('выполняется…', 'busy');
+  try {
+    const res = await op({ action: 'exec', cmd: line, cwd: cwd, timeout: TIMEOUT },
+                         controller.signal);
+    if (res.out) write(ansiToHtml(res.out));
+    if (res.err) write(ansiToHtml(res.err));
+    if (res.code !== 0) write('<span class="meta">[exit ' + res.code + ']</span>');
+    if (res.cwd) setCwd(res.cwd);
+  } catch (e) {
+    if (e.name === 'AbortError') write('<span class="err">^C (клиент отвалился, процесс на сервере продолжает работу)</span>');
+    else { write(esc(String(e.message || e)), 'err'); setStatus('ошибка', 'err'); return; }
+  } finally {
+    controller = null;
+  }
+}
+
+input.addEventListener('keydown', function (ev) {
+  if (ev.key === 'Enter') {
+    const line = input.value;
+    input.value = '';
+    if (line.trim()) {
+      history.push(line);
+      if (history.length > 300) history.shift();
+      localStorage.setItem('stashapi_hist', JSON.stringify(history));
+    }
+    hidx = history.length;
+    submit(line);
+  } else if (ev.key === 'ArrowUp') {
+    ev.preventDefault();
+    if (hidx > 0) { hidx--; input.value = history[hidx]; }
+  } else if (ev.key === 'ArrowDown') {
+    ev.preventDefault();
+    if (hidx < history.length - 1) { hidx++; input.value = history[hidx]; }
+    else { hidx = history.length; input.value = ''; }
+  } else if (ev.key === 'c' && ev.ctrlKey) {
+    if (controller) { ev.preventDefault(); controller.abort(); }
+  } else if (ev.key === 'l' && ev.ctrlKey) {
+    ev.preventDefault();
+    term.innerHTML = '';
+  }
+});
+
+document.getElementById('clear').addEventListener('click', function () {
+  term.innerHTML = '';
+  input.focus();
+});
+
+document.getElementById('reset').addEventListener('click', async function () {
+  try {
+    const r = await op({ action: 'reset' });
+    setCwd(r.cwd);
+    write('<span class="meta">рабочая папка сброшена на ' + esc(r.cwd) + '</span>');
+  } catch (e) { write(esc(String(e.message || e)), 'err'); }
+  input.focus();
+});
+
+(async function init() {
+  try {
+    const info = await op({ action: 'hello' });
+    setCwd(cwd || info.cwd);
+    write('<span class="meta">Remote Shell — ' + esc(info.user + '@' + info.host) + '</span>');
+    write('<span class="meta">' + esc(info.os) + ' · Python ' + esc(info.python) + '</span>');
+    write('<span class="meta">каждая команда — отдельный cmd.exe; рабочая папка запоминается, переменные окружения — нет</span>');
+    setStatus('готово');
+  } catch (e) {
+    write(esc('Плагин недоступен: ' + (e.message || e)), 'err');
+    setStatus('нет связи', 'err');
+  }
+  input.focus();
+})();
+</script>
+</body>
+</html>

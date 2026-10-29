@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>File Explorer</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #12141a; color: #dcdfe6;
+               font: 13px/1.4 "Segoe UI", system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #bar { display: flex; gap: 8px; padding: 8px; background: #1b1e26;
+         border-bottom: 1px solid #2b2f3a; align-items: center; flex-wrap: wrap; }
+  input[type=text], select { background: #0f1116; color: #dcdfe6;
+                     border: 1px solid #3a4050; border-radius: 4px; padding: 5px 8px; font: inherit; }
+  #path { flex: 1; min-width: 180px; }
+  #filter { width: 180px; }
+  button { background: #2b2f3a; color: #dcdfe6; border: 1px solid #3a4050;
+           border-radius: 4px; padding: 5px 10px; cursor: pointer; font: inherit; }
+  button:hover { background: #363b48; }
+  #drives { display: flex; gap: 6px; padding: 6px 8px; flex-wrap: wrap;
+            background: #161922; border-bottom: 1px solid #2b2f3a; }
+  #drives button { padding: 3px 9px; }
+  #list { flex: 1; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  th { position: sticky; top: 0; z-index: 1; background: #1b1e26; text-align: left;
+       padding: 6px 10px; border-bottom: 1px solid #2b2f3a; color: #8b93a3; font-weight: 600; }
+  td { padding: 4px 10px; border-bottom: 1px solid #1e222c; overflow: hidden;
+       text-overflow: ellipsis; white-space: nowrap; }
+  tr:hover td { background: #171b24; }
+  a { color: #61afef; text-decoration: none; cursor: pointer; }
+  a:hover { text-decoration: underline; }
+  .dir { color: #e5c07b; font-weight: 600; }
+  .size, .date { color: #8b93a3; }
+  .act { text-align: right; }
+  .act a { margin-left: 10px; color: #8b93a3; }
+  .act a:hover { color: #dcdfe6; }
+  #foot { padding: 6px 10px; background: #161922; border-top: 1px solid #2b2f3a; }
+  #foot button { padding: 3px 10px; }
+  #status { padding: 5px 10px; background: #161922; color: #8b93a3;
+            border-top: 1px solid #2b2f3a; }
+  #status.err { color: #e06c75; }
+  #status.busy { color: #e5c07b; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <button id="up">↑</button>
+  <button id="refresh">⟳</button>
+  <input type="text" id="path" spellcheck="false">
+  <button id="go">Перейти</button>
+  <input type="text" id="filter" placeholder="фильтр…" spellcheck="false">
+  <button id="mkdir">+ Папка</button>
+  <button id="upload">↑ Файл</button>
+  <select id="level" title="Сжатие zip для папок">
+    <option value="9" selected>zip: макс.</option>
+    <option value="6">zip: обычное</option>
+    <option value="1">zip: быстрое</option>
+    <option value="0">zip: без сжатия</option>
+  </select>
+  <input type="file" id="file" style="display:none">
+</div>
+<div id="drives"></div>
+<div id="list"></div>
+<div id="foot" style="display:none"><button id="more">показать ещё</button></div>
+<div id="status">…</div>
+<script>
+const PLUGIN = location.pathname.split('/')[2] || 'stashapi';
+const QUERY = 'mutation($p:ID!,$a:Map!){runPluginOperation(plugin_id:$p,args:$a)}';
+const BIG_WARN = 64 * 1024 * 1024;
+
+function parseRes(r) {
+  if (r && typeof r === 'object') return r;
+  var s = String(r ?? '');
+  var i = s.search(/[{[]/);
+  if (i > 0) {
+    try { return JSON.parse(s.slice(i)); } catch (e) { /* ignore */ }
+  }
+  try { return JSON.parse(s); } catch (e) { /* ignore */ }
+  return { output: s };
+}
+const CHUNK = 300;
+let PATH_SEP = '/';
+
+const listEl = document.getElementById('list');
+const drivesEl = document.getElementById('drives');
+const pathEl = document.getElementById('path');
+const filterEl = document.getElementById('filter');
+const statusEl = document.getElementById('status');
+const levelEl = document.getElementById('level');
+const footEl = document.getElementById('foot');
+const moreEl = document.getElementById('more');
+
+let current = '';
+let parent = null;
+let downloading = false;
+let allItems = [];
+let shown = 0;
+
+function setStatus(t, cls) { statusEl.textContent = t; statusEl.className = cls || ''; }
+
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function attr(s) {
+  return esc(s).replace(/"/g, '&quot;');
+}
+
+async function op(args) {
+  const r = await fetch('/graphql', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ query: QUERY, variables: { p: PLUGIN, a: args } }),
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const j = await r.json();
+  if (j.errors && j.errors.length) throw new Error(j.errors.map(function (e) { return e.message; }).join('; '));
+  if (!j.data || !j.data.runPluginOperation) throw new Error('пустой ответ плагина');
+  return parseRes(j.data.runPluginOperation);
+}
+
+function fmtSize(n) {
+  if (n === null || n === undefined) return '';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(1)) + ' ' + u[i];
+}
+
+function fmtDate(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const p = function (x) { return String(x).padStart(2, '0'); };
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+         p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+function joinPath(base, name) {
+  const sep = PATH_SEP || '/';
+  return String(base).replace(/[\\/]+$/, '') + sep + name;
+}
+
+function visible() {
+  const q = filterEl.value.trim().toLowerCase();
+  if (!q) return allItems;
+  return allItems.filter(function (it) { return it.name.toLowerCase().indexOf(q) !== -1; });
+}
+
+function rowHtml(it) {
+  const cls = it.dir ? ' class="dir"' : '';
+  const act = it.dir ? 'download' : 'download';
+  return '<tr>' +
+    '<td><a data-act="open" data-name="' + attr(it.name) + '" data-dir="' + (it.dir ? '1' : '0') + '"' + cls + '>' +
+      (it.dir ? '📁 ' : '📄 ') + esc(it.name) + '</a></td>' +
+    '<td class="size">' + fmtSize(it.size) + '</td>' +
+    '<td class="date">' + fmtDate(it.mtime) + '</td>' +
+    '<td class="act">' +
+      '<a data-act="' + act + '" data-name="' + attr(it.name) + '" data-dir="' + (it.dir ? '1' : '0') + '">' +
+        (it.dir ? 'скачать zip' : 'скачать') + '</a>' +
+      '<a data-act="rename" data-name="' + attr(it.name) + '">переименовать</a>' +
+      '<a data-act="delete" data-name="' + attr(it.name) + '" data-dir="' + (it.dir ? '1' : '0') + '">удалить</a>' +
+    '</td></tr>';
+}
+
+function paint(append) {
+  const items = visible();
+  const slice = items.slice(shown, shown + CHUNK);
+  const html = slice.map(rowHtml).join('');
+  const table = listEl.querySelector('table');
+
+  if (!append || !table) {
+    listEl.innerHTML = '<table><thead><tr><th style="width:55%">Имя</th>' +
+      '<th style="width:12%">Размер</th><th style="width:18%">Изменён</th><th></th></tr></thead>' +
+      '<tbody>' + html + '</tbody></table>';
+  } else {
+    table.querySelector('tbody').insertAdjacentHTML('beforeend', html);
+  }
+  shown += slice.length;
+
+  const left = items.length - shown;
+  footEl.style.display = left > 0 ? '' : 'none';
+  if (left > 0) moreEl.textContent = 'показать ещё ' + Math.min(left, CHUNK) + ' (осталось ' + left + ')';
+  else if (shown > 0) setStatus(shown + ' элементов' + (items.length !== allItems.length ? ' (отфильтровано из ' + allItems.length + ')' : ''));
+}
+
+async function load(p) {
+  setStatus('читаю ' + (p || '…'));
+  try {
+    const res = await op({ action: 'list', path: p });
+    if (!res) throw new Error('нет ответа плагина');
+    current = res.path || p || '';
+    parent = (res.parent === undefined) ? null : res.parent;
+    pathEl.value = current;
+
+    const drivesKey = (res.drives || []).join('|');
+    if (drivesEl.dataset.key !== drivesKey) {
+      drivesEl.dataset.key = drivesKey;
+      drivesEl.innerHTML = (res.drives || []).map(function (d) {
+        return '<button data-drive="' + attr(d) + '">' + esc(d) + '</button>';
+      }).join('');
+    }
+
+    allItems = (res && res.items) ? res.items : [];
+    shown = 0;
+    paint(false);
+
+    if (res.error) setStatus(res.error, 'err');
+    else if (!allItems.length) setStatus('пусто');
+    else if (shown >= allItems.length) setStatus(allItems.length + ' элементов');
+  } catch (e) {
+    setStatus(String(e.message || e), 'err');
+  }
+}
+
+async function b64ToBlob(b64, mime) {
+  let bin;
+  try { bin = atob(b64); }
+  catch (e) { throw new Error('неверный base64: ' + (e.message || e)); }
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return new Blob([buf], { type: mime || 'application/octet-stream' });
+}
+
+async function download(path, name, isDir, fresh) {
+  if (downloading) { setStatus('уже идёт другое скачивание…', 'busy'); return; }
+  downloading = true;
+  setStatus(isDir ? 'упаковываю ' + name + '…' : 'готовлю ' + name + '…', 'busy');
+  try {
+    const args = { action: 'download', path: path };
+    if (isDir) args.level = parseInt(levelEl.value, 10);
+    if (fresh) args.fresh = true;
+
+    const res = await op(args);
+    if (!res) throw new Error('нет ответа плагина');
+    if (res.error) throw new Error(res.error);
+    const outName = res.name || name;
+
+    if (res.url) {
+      const a = document.createElement('a');
+      a.href = res.url;
+      a.download = outName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setStatus('отдаю: ' + outName + ' (' + fmtSize(res.size) + ')');
+      return;
+    }
+
+    if (res.size > BIG_WARN) {
+      setStatus('готово ' + fmtSize(res.size) + ', декодирую base64…', 'busy');
+      await new Promise(function (r) { setTimeout(r, 30); });
+    }
+    if (!res.data && !res.url) throw new Error('нет данных для скачивания');
+    const blob = await b64ToBlob(res.data, res.mime || 'application/octet-stream');
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = outName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 120000);
+    setStatus('готово: ' + outName + ' (' + fmtSize(res.size) + ')');
+  } catch (e) {
+    setStatus('ошибка скачивания: ' + (e.message || e), 'err');
+  } finally {
+    downloading = false;
+  }
+}
+
+async function rename(path, name) {
+  const nn = prompt('Новое имя:', name);
+  if (!nn || nn === name) return;
+  try {
+    await op({ action: 'rename', path: path, to: joinPath(current, nn) });
+    load(current);
+  } catch (e) { setStatus(String(e.message || e), 'err'); }
+}
+
+async function remove(path, name) {
+  if (!confirm('Удалить ' + name + '?')) return;
+  try {
+    await op({ action: 'delete', path: path, recursive: true });
+    load(current);
+  } catch (e) { setStatus(String(e.message || e), 'err'); }
+}
+
+listEl.addEventListener('click', function (ev) {
+  const a = ev.target.closest('a[data-act]');
+  if (!a) return;
+  ev.preventDefault();
+  const name = a.dataset.name;
+  const full = joinPath(current, name);
+  const isDir = a.dataset.dir === '1';
+  const act = a.dataset.act;
+
+  if (act === 'open') { if (isDir) load(full); else download(full, name, false, ev.shiftKey); }
+  else if (act === 'download') download(full, name, isDir, ev.shiftKey);
+  else if (act === 'rename') rename(full, name);
+  else if (act === 'delete') remove(full, name);
+});
+
+drivesEl.addEventListener('click', function (ev) {
+  const b = ev.target.closest('button[data-drive]');
+  if (b) load(b.dataset.drive);
+});
+
+let filterTimer = null;
+filterEl.addEventListener('input', function () {
+  clearTimeout(filterTimer);
+  filterTimer = setTimeout(function () { shown = 0; paint(false); }, 150);
+});
+
+moreEl.onclick = function () { paint(true); };
+document.getElementById('up').onclick = function () { if (parent) load(parent); };
+document.getElementById('refresh').onclick = function () { load(current); };
+document.getElementById('go').onclick = function () { load(pathEl.value); };
+pathEl.addEventListener('keydown', function (e) { if (e.key === 'Enter') load(pathEl.value); });
+
+document.getElementById('mkdir').onclick = async function () {
+  const n = prompt('Имя новой папки:');
+  if (!n) return;
+  try {
+    await op({ action: 'mkdir', path: joinPath(current, n) });
+    load(current);
+  } catch (e) { setStatus(String(e.message || e), 'err'); }
+};
+
+document.getElementById('upload').onclick = function () { document.getElementById('file').click(); };
+document.getElementById('file').onchange = function (ev) {
+  const f = ev.target.files[0];
+  if (!f) return;
+  if (f.size > BIG_WARN) setStatus('файл ' + fmtSize(f.size) + ' — заливаю через base64, это небыстро…', 'busy');
+  const fr = new FileReader();
+  fr.onload = async function () {
+    const b64 = String(fr.result).split(',')[1];
+    try {
+      setStatus('заливаю ' + f.name + '…', 'busy');
+      await op({ action: 'upload', path: current, name: f.name, data: b64 });
+      setStatus('загружено: ' + f.name);
+      load(current);
+    } catch (e) { setStatus('ошибка загрузки: ' + (e.message || e), 'err'); }
+  };
+  fr.readAsDataURL(f);
+  ev.target.value = '';
+};
+
+(async function init() {
+  try {
+    const info = await op({ action: 'hello' });
+    if (info && info.sep) PATH_SEP = info.sep;
+    const defPath = info && info.cwd ? info.cwd : (PATH_SEP === '\\' ? 'C:\\' : '/');
+    load(defPath);
+  } catch (e) {
+    setStatus('плагин недоступен: ' + (e.message || e), 'err');
+  }
+})();
+</script>
+</body>
+</html>
