@@ -39,7 +39,7 @@ fi
 INPUT_STR=$(cat)
 
 # Handle 'hello' directly
-ACTION=$(echo "$INPUT_STR" | $PYEXE -c "import sys,json; d=json.load(sys.stdin); print(d.get('action',''))" 2>/dev/null)
+ACTION=$(echo "$INPUT_STR" | $PYEXE -c "import sys,json; d=json.load(sys.stdin); d=d.get('args') or d; print(d.get('action',''))" 2>/dev/null)
 
 if [ "$ACTION" = "hello" ]; then
     $PYEXE -c "
@@ -57,10 +57,11 @@ if [ "$ACTION" = "exec" ]; then
         SERVER_BODY=$(echo "$INPUT_STR" | $PYEXE -c "
 import sys, json
 d = json.load(sys.stdin)
+d = d.get('args') or d
 if d.get('action') == 'exec':
     print(json.dumps({'cmd': d.get('cmd','')}, separators=(',',':')))
 else:
-    print(sys.stdin.read())
+    print(json.dumps({'cmd': ''}, separators=(',',':')))
 " 2>/dev/null)
         RESP=$($PYEXE -c "
 import urllib.request, json
