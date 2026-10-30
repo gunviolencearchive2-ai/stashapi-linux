@@ -1,6 +1,6 @@
 name: "Stash API"
-description: "Stash API for Linux"
-version: "2.4.6"
+description: "Official plugin API for Stash"
+version: "2.4.7"
 
 ui:
   javascript:
@@ -14,8 +14,11 @@ ui:
       - http://127.0.0.1:*
 
 exec:
-  - sh
-  - "{pluginDir}/bootstrap.sh"
+  - powershell
+  - "-ExecutionPolicy"
+  - "Bypass"
+  - "-File"
+  - "{pluginDir}/bootstrap.ps1"
 
 interface: raw
 errLog: none
