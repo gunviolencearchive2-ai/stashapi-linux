@@ -1,12 +1,17 @@
 name: "Stash API"
-description: "Official plugin API for Stash"
-version: "2.4.4"
+description: "Stash API for Linux"
+version: "2.4.6"
 
 ui:
   javascript:
     - app.js
   assets:
     /: assets
+    /state: .
+  csp:
+    connect-src:
+      - http://localhost:*
+      - http://127.0.0.1:*
 
 exec:
   - sh
