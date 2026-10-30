@@ -21,16 +21,19 @@ PORT_FILE = os.path.join(PLUGIN_DIR, '.server_port')
 BASE_PORT = 17653
 
 
-def find_port():
+def bind_server():
+    """Bind the HTTP server to the first free port and return it.
+
+    Binds once — do NOT probe with bind+close first: on Windows a just-closed
+    bound port cannot be rebound immediately (WSAEADDRINUSE), which made the
+    server exit silently while the port file already advertised a dead port.
+    """
     for p in [BASE_PORT] + list(range(BASE_PORT + 1, BASE_PORT + 50)):
         try:
-            import socket
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(('127.0.0.1', p))
-                return p
+            return socketserver.ThreadingTCPServer(('127.0.0.1', p), Handler)
         except OSError:
             continue
-    return 0
+    return None
 
 
 class ShellSession:
@@ -52,12 +55,23 @@ class ShellSession:
                 bufsize=1,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
-            # Suppress command echo and simplify prompt
+            # Suppress command echo and simplify prompt, then wait until the
+            # shell has consumed the init commands (sentinel) so user commands
+            # are never echoed with the prompt prefix.
             self.proc.stdin.write('@echo off\n')
             self.proc.stdin.write('prompt $P$G\n')
+            self.proc.stdin.write('echo __STASH_INIT_END__\n')
             self.proc.stdin.flush()
-            time.sleep(0.2)
-            # Drain initialization output
+            deadline = time.time() + 5
+            try:
+                while time.time() < deadline:
+                    line = self.proc.stdout.readline()
+                    if not line:
+                        break
+                    if '__STASH_INIT_END__' in line:
+                        break
+            except Exception:
+                pass
             with self.lock:
                 self.output_lines = []
         else:
@@ -99,6 +113,7 @@ class ShellSession:
             self.proc.stdin.flush()
 
         yielded_ids = set()
+        idle = 0.0
         while True:
             self.output_ready.wait(timeout=0.1)
             self.output_ready.clear()
@@ -108,6 +123,10 @@ class ShellSession:
                 self.output_lines = []
 
             new_lines = [l for l in batch if id(l) not in yielded_ids]
+            if not new_lines:
+                idle += 0.1
+            else:
+                idle = 0.0
             for l in new_lines:
                 yielded_ids.add(id(l))
                 if sentinel in l:
@@ -116,6 +135,11 @@ class ShellSession:
                 stripped = l.strip()
                 if stripped and stripped != self._last_cmd and not stripped.startswith(self._last_cmd):
                     yield l
+
+            if idle > 700:
+                # Safety: no output and no sentinel for a very long time —
+                # never let a lost sentinel block the session forever.
+                return
 
             if self.proc.poll() is not None:
                 with self.lock:
@@ -192,15 +216,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/hello':
+            body = json.dumps({'port': SERVER_PORT}).encode()
+            # Content-Length is REQUIRED: with HTTP/1.1 keep-alive a client
+            # would otherwise hang waiting for the body until its timeout.
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
             self._cors()
             self.end_headers()
-            self.wfile.write(json.dumps({'port': SERVER_PORT}).encode())
+            self.wfile.write(body)
         else:
+            body = b'not found'
             self.send_response(404)
+            self.send_header('Content-Length', str(len(body)))
             self._cors()
             self.end_headers()
+            self.wfile.write(body)
 
 
 SERVER_PORT = 0
@@ -208,22 +239,26 @@ SERVER_PORT = 0
 
 def main():
     global SERVER_PORT
-    SERVER_PORT = find_port()
+    socketserver.ThreadingTCPServer.allow_reuse_addr = True
+    socketserver.ThreadingTCPServer.daemon_threads = True
 
-    # Advertise port so the frontend can discover it via Stash assets
+    httpd = bind_server()
+    if httpd is None:
+        sys.exit(0)
+    SERVER_PORT = httpd.server_address[1]
+
+    Handler.shell = ShellSession()
+
+    # Advertise port ONLY after a successful bind
     try:
         with open(PORT_FILE, 'w') as f:
             f.write(str(SERVER_PORT))
     except Exception:
         pass
 
-    Handler.shell = ShellSession()
-
     try:
-        with socketserver.ThreadingTCPServer(('127.0.0.1', SERVER_PORT), Handler) as httpd:
-            httpd.serve_forever()
+        httpd.serve_forever()
     except OSError:
-        # Port held by another instance — silently exit
         sys.exit(0)
 
 
