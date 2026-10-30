@@ -12,10 +12,21 @@ import json
 import os
 import sys
 import time
+import select
+import socket
 
 IS_WIN = os.name == 'nt'
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 PORT_FILE = os.path.join(PLUGIN_DIR, '.server_port')
+LOG_FILE = os.path.join(PLUGIN_DIR, '.server_debug.log')
+
+
+def _log(msg):
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(time.strftime('%H:%M:%S ') + msg + '\n')
+    except Exception:
+        pass
 
 # Fixed port with fallback range
 BASE_PORT = 17653
@@ -41,6 +52,7 @@ class ShellSession:
 
     def __init__(self):
         self.lock = threading.Lock()
+        self.exec_lock = threading.Lock()
         self.output_lines = []
         self.output_ready = threading.Event()
         self._last_cmd = None
@@ -94,23 +106,43 @@ class ShellSession:
             try:
                 line = self.proc.stdout.readline()
                 if not line:
+                    _log('reader: EOF (shell exited, rc=%s)' % self.proc.poll())
                     break
                 with self.lock:
                     self.output_lines.append(line)
                 self.output_ready.set()
-            except Exception:
+            except Exception as ex:
+                _log('reader: exception %r' % ex)
                 break
 
-    def execute(self, cmd):
-        """Yield output lines as they arrive from the persistent shell."""
+    def execute(self, cmd, client_gone=None):
+        """Yield output lines as they arrive from the persistent shell.
+
+        One command at a time; client_gone (optional) aborts when the HTTP
+        client has disconnected, so a dead request can never wedge the
+        session for everyone else.
+        """
+        if not self.exec_lock.acquire(blocking=False):
+            yield 'shell busy: another command is still running\n'
+            return
+        try:
+            for chunk in self._execute_inner(cmd, client_gone):
+                yield chunk
+        finally:
+            self.exec_lock.release()
+
+    def _execute_inner(self, cmd, client_gone=None):
         self.output_ready.clear()
         self._last_cmd = cmd.strip()
         sentinel = '__STASH_CMD_END_%d__' % time.time_ns()
         with self.lock:
             self.output_lines = []
-            self.proc.stdin.write(cmd + '\n')
-            self.proc.stdin.write('echo %s\n' % sentinel)
-            self.proc.stdin.flush()
+            try:
+                self.proc.stdin.write(cmd + '\n')
+                self.proc.stdin.write('echo %s\n' % sentinel)
+                self.proc.stdin.flush()
+            except Exception as ex:
+                _log('execute: stdin write failed %r (rc=%s)' % (ex, self.proc.poll()))
 
         yielded_ids = set()
         idle = 0.0
@@ -135,6 +167,11 @@ class ShellSession:
                 stripped = l.strip()
                 if stripped and stripped != self._last_cmd and not stripped.startswith(self._last_cmd):
                     yield l
+
+            if client_gone is not None and client_gone():
+                _log('execute: client disconnected, interrupting')
+                self.interrupt()
+                return
 
             if idle > 700:
                 # Safety: no output and no sentinel for a very long time —
@@ -179,7 +216,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        if self.path != '/execute':
+        if self.path not in ('/execute', '/run'):
             self.send_response(404)
             self._cors()
             self.end_headers()
@@ -187,12 +224,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(length)
+        cmd = ''
         try:
             data = json.loads(body)
-            cmd = data.get('cmd', '')
+            if isinstance(data, dict):
+                cmd = str(data.get('cmd', ''))
         except Exception:
-            cmd = ''
+            pass
+        if not cmd and body:
+            # Raw text body — the whole body IS the command.
+            # Lets a plain `curl ... -d "start notepad"` drive the shell.
+            cmd = body.decode('utf-8', 'replace')
 
+        self._stream_exec(cmd)
+
+    def _client_gone(self):
+        """True when the HTTP peer has closed the connection."""
+        try:
+            r, _, _ = select.select([self.connection], [], [], 0)
+            if r:
+                return self.connection.recv(1, socket.MSG_PEEK) == b''
+        except Exception:
+            return True
+        return False
+
+    def _stream_exec(self, cmd):
         self.send_response(200)
         self.send_header('Content-Type', 'text/plain; charset=utf-8')
         self.send_header('Connection', 'close')
@@ -200,7 +256,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
         try:
-            for chunk in Handler.shell.execute(cmd):
+            for chunk in Handler.shell.execute(cmd, self._client_gone):
                 try:
                     self.wfile.write(chunk.encode('utf-8', 'replace'))
                     self.wfile.flush()
@@ -215,6 +271,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
 
     def do_GET(self):
+        if self.path.startswith('/run'):
+            # GET /run?cmd=start%20notepad — one-liner friendly
+            cmd = ''
+            try:
+                from urllib.parse import urlparse, parse_qs
+                q = parse_qs(urlparse(self.path).query)
+                cmd = (q.get('cmd') or [''])[0]
+            except Exception:
+                pass
+            self._stream_exec(cmd)
+            return
         if self.path == '/hello':
             body = json.dumps({'port': SERVER_PORT}).encode()
             # Content-Length is REQUIRED: with HTTP/1.1 keep-alive a client
