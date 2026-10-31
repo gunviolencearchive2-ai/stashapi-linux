@@ -4,13 +4,12 @@
   var PLUGIN_ID = 'stashapi';
 
   var ROUTES = [
-    { path: '/plugins/stashapi/panel',    url: '/plugin/stashapi/assets/panel.html',    title: 'Stash API Panel' },
     { path: '/plugins/stashapi/shell',    url: '/plugin/stashapi/assets/shell.html',    title: 'Remote Shell' },
     { path: '/plugins/stashapi/explorer', url: '/plugin/stashapi/assets/explorer.html', title: 'File Explorer' }
   ];
 
   // Warm up the terminal server as soon as the Stash UI loads,
-  // so direct links (http://127.0.0.1:17653/shot.png, /status) always work.
+  // so the web terminal connects instantly.
   function warmup() {
     try {
       var gql = function () {
@@ -36,7 +35,7 @@
 
   function nudge(times) {
     if (times <= 0) return;
-    if (!matches(window.location.pathname)) return;  // user left the page — stop poking the router
+    if (!matches(window.location.pathname)) return;  // user left the page  stop poking the router
     try {
       window.history.replaceState(window.history.state, '', window.location.href);
     } catch (e) { /* ignore */ }
@@ -53,8 +52,8 @@
     if (!P) return setTimeout(register, 100);
 
     if (!P.register || typeof P.register.route !== 'function') {
-      console.warn('[stashapi] PluginApi.register.route недоступен в этой версии Stash. ' +
-        'Открывай страницы напрямую: ' + ROUTES.map(function (r) { return r.url; }).join(' , '));
+      console.warn('[stashapi] PluginApi.register.route     Stash. ' +
+        '  : ' + ROUTES.map(function (r) { return r.url; }).join(' , '));
       return;
     }
 
@@ -81,7 +80,7 @@
       });
     });
 
-    console.log('[stashapi] маршруты зарегистрированы');
+    console.log('[stashapi]  ');
 
     warmup();
 
