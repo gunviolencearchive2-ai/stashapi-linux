@@ -430,6 +430,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self._origin_ok():
             self._plain(403, 'forbidden')
             return
+        if self.path == '/interrupt':
+            # kills the running foreground command (tree); the blocked exec
+            # request notices the dead process and finishes
+            if Handler.shell:
+                Handler.shell.interrupt()
+            self._plain(200, 'ok')
+            return
         if self.path == '/dirsize':
             # folder sizes WITHOUT going through the Stash GraphQL queue
             # (each GraphQL op spawns a PowerShell -- that starved everything)
