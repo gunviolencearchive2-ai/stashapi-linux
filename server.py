@@ -331,13 +331,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.close_connection = True
 
     def _origin_ok(self):
-        """Only local pages (Stash UI) may read us cross-origin; curl has no Origin."""
+        """Only pages on this machine or its private networks may read us
+        cross-origin (a public site must not be able to drive the shell);
+        curl and same-origin requests send no Origin header."""
         o = self.headers.get('Origin')
         if not o:
             return True
         try:
             from urllib.parse import urlparse
-            return urlparse(o).hostname in ('localhost', '127.0.0.1', '::1')
+            host = (urlparse(o).hostname or '').lower()
+            if host in ('localhost', '127.0.0.1', '::1'):
+                return True
+            # private networks (LAN access to a remote Stash is normal usage)
+            if host.startswith('192.168.') or host.startswith('10.'):
+                return True
+            if host.startswith('172.'):
+                try:
+                    if 16 <= int(host.split('.')[1]) <= 31:
+                        return True
+                except (ValueError, IndexError):
+                    pass
+            # the server machine's own addresses / the interface the request
+            # arrived on (a Stash host may be reached by any of its names)
+            local = set()
+            try:
+                local |= {i[4][0] for i in socket.getaddrinfo(socket.gethostname(), None)}
+                local.add(self.connection.getsockname()[0])
+            except Exception:
+                pass
+            if host in local:
+                return True
+            return False
         except Exception:
             return False
 
