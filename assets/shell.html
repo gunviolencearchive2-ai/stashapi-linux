@@ -17,7 +17,6 @@
   button { background: #2b2f3a; color: #dcdfe6; border: 1px solid #3a4050;
            border-radius: 4px; padding: 3px 10px; cursor: pointer; font: inherit; }
   button:hover { background: #363b48; }
-  button:disabled { opacity: 0.5; cursor: not-allowed; }
   #term { flex: 1; overflow-y: auto; padding: 10px; white-space: pre-wrap;
           word-break: break-word; }
   #term .cmd { color: #61afef; }
@@ -42,8 +41,8 @@
   <span id="cwd">…</span>
   <span id="status">подключение…</span>
   <button id="reset">сброс папки</button>
-  <button id="kill">стоп (Ctrl+C)</button>
   <button id="clear">clear</button>
+  <button id="kill">стоп (Ctrl+C)</button>
 </div>
 <div id="term"></div>
 <div id="inputline">
@@ -73,13 +72,12 @@ const statusEl = document.getElementById('status');
 const killBtn = document.getElementById('kill');
 
 let cwd = localStorage.getItem('stashapi_cwd') || '';
-let serverPort = null;
 let history = [];
 try { history = JSON.parse(localStorage.getItem('stashapi_hist') || '[]'); } catch (e) { history = []; }
 let hidx = history.length;
 
-let controller = null;
 let busy = false;
+let running = false;
 
 function setStatus(t, cls) { statusEl.textContent = t; statusEl.className = cls || ''; }
 
@@ -122,6 +120,8 @@ function write(html, cls) {
   term.scrollTop = term.scrollHeight;
 }
 
+// ALL traffic goes through Stash itself (GraphQL) — no extra ports, works
+// from any browser that can open Stash, including remote machines.
 async function stashOp(args, signal) {
   const r = await fetch('/graphql', {
     method: 'POST',
@@ -136,82 +136,52 @@ async function stashOp(args, signal) {
   return parseRes(j.data.runPluginOperation);
 }
 
-async function discoverServerPort() {
-  try {
-    const info = await stashOp({ action: 'hello' });
-    serverPort = info.server_port;
-    if (serverPort) {
-      // Verify the server is reachable
-      try {
-        const r = await fetch('http://127.0.0.1:' + serverPort + '/hello', { cache: 'no-store' });
-        if (r.ok) return true;
-      } catch (e) { /* server not up yet */ }
-    }
-  } catch (e) { /* stash might not be ready */ }
-  return false;
-}
-
 async function runCommand(line) {
-  if (!serverPort) {
-    write(esc('сервер терминала не доступен'), 'err');
-    setStatus('нет связи', 'err');
-    return;
-  }
-
   write(esc(promptEl.textContent) + ' ' + esc(line), 'cmd');
   if (!line.trim()) return;
 
-  controller = new AbortController();
+  running = true;
+  busy = true;
   setStatus('выполняется…', 'busy');
   killBtn.disabled = false;
 
   try {
-    const res = await fetch('http://127.0.0.1:' + serverPort + '/execute', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cmd: line, cwd: cwd }),
-      signal: controller.signal,
-    });
-    if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      // Process complete lines
-      const lines = buf.split('\n');
-      buf = lines.pop(); // keep incomplete line in buffer
-      for (const ln of lines) {
-        if (ln) write(ansiToHtml(ln));
-      }
-    }
-    if (buf) write(ansiToHtml(buf));
-
+    const res = await stashOp({ action: 'exec', cmd: line, cwd: cwd });
+    const out = res && (res.output || res);
+    if (out && out.out) write(ansiToHtml(out.out));
+    if (out && out.err) write(ansiToHtml(out.err), 'err');
+    if (out && out.cwd) setCwd(out.cwd);
     setStatus('готово');
   } catch (e) {
     if (e.name === 'AbortError') {
-      write('<span class="err">^C (прервано пользователем)</span>');
+      write('<span class="meta">ожидание отменено (команда остановлена ниже)</span>');
+      setStatus('готово');
     } else {
       write(esc(String(e.message || e)), 'err');
       setStatus('ошибка', 'err');
     }
   } finally {
-    controller = null;
-    killBtn.disabled = true;
+    running = false;
     busy = false;
+    killBtn.disabled = true;
     input.focus();
   }
 }
 
+function interrupt() {
+  // runs alongside the blocked exec request: plugin kills the command
+  write('<span class="err">^C</span>');
+  stashOp({ action: 'interrupt' }).catch(function () { });
+}
+
 function submit(line) {
+  if (busy && !running) return;  // waiting for a finished op — ignore
   runCommand(line);
 }
 
 input.addEventListener('keydown', function (ev) {
   if (ev.key === 'Enter') {
+    if (busy) return;
     const line = input.value;
     input.value = '';
     if (line.trim()) {
@@ -229,7 +199,7 @@ input.addEventListener('keydown', function (ev) {
     if (hidx < history.length - 1) { hidx++; input.value = history[hidx]; }
     else { hidx = history.length; input.value = ''; }
   } else if (ev.key === 'c' && ev.ctrlKey) {
-    if (controller) { ev.preventDefault(); controller.abort(); }
+    if (running) { ev.preventDefault(); interrupt(); }
   } else if (ev.key === 'l' && ev.ctrlKey) {
     ev.preventDefault();
     term.innerHTML = '';
@@ -242,41 +212,28 @@ document.getElementById('clear').addEventListener('click', function () {
 });
 
 killBtn.addEventListener('click', function () {
-  if (controller) {
-    controller.abort();
-    killBtn.disabled = true;
-  }
+  if (running) interrupt();
 });
 
 document.getElementById('reset').addEventListener('click', async function () {
   try {
     const r = await stashOp({ action: 'reset' });
-    setCwd(r.cwd);
-    write('<span class="meta">рабочая папка сброшена на ' + esc(r.cwd) + '</span>');
+    const o = r && (r.output || r);
+    setCwd((o && o.cwd) || cwd || '');
+    write('<span class="meta">рабочая папка сброшена на ' + esc((o && o.cwd) || '') + '</span>');
   } catch (e) { write(esc(String(e.message || e)), 'err'); }
   input.focus();
 });
 
 (async function init() {
   try {
-    const ok = await discoverServerPort();
-    if (!ok) {
-      // Retry a few times
-      for (let i = 0; i < 10 && !serverPort; i++) {
-        await new Promise(r => setTimeout(r, 500));
-        await discoverServerPort();
-      }
-    }
-    if (serverPort) {
-      write('<span class="meta">Remote Shell — сервер на 127.0.0.1:' + serverPort + '</span>');
-      setCwd(cwd || '');
-      setStatus('готово');
-    } else {
-      write(esc('сервер терминала не запустился'), 'err');
-      setStatus('нет связи', 'err');
-    }
+    const info = await stashOp({ action: 'hello' });
+    const o = info && (info.output || info);
+    setCwd((o && o.cwd) || cwd || '');
+    write('<span class="meta">Remote Shell — ' + esc((o && o.host) || '?') + '</span>');
+    setStatus('готово');
   } catch (e) {
-    write(esc('ошибка подключения: ' + String(e.message || e)), 'err');
+    write(esc('Плагин недоступен: ' + (e.message || e)), 'err');
     setStatus('нет связи', 'err');
   }
   input.focus();
