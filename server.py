@@ -942,7 +942,16 @@ def main():
 
 
 if __name__ == '__main__':
+    # capture ANY startup crash into the debug log (bootstrap launches us
+    # hidden, so without this the reason would be invisible on remotes)
+    try:
+        sys.stderr = open(LOG_FILE, 'a', encoding='utf-8')
+    except Exception:
+        pass
     try:
         main()
     except KeyboardInterrupt:
         pass
+    except Exception:
+        import traceback
+        _log('server crashed: %s' % traceback.format_exc())
