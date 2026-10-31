@@ -21,7 +21,10 @@ if [ -n "$PORT" ]; then
 fi
 
 if [ "$SERVER_UP" = false ]; then
-    nohup "$PYEXE" "$DIR/server.py" >/dev/null 2>&1 &
+    # < /dev/null is CRITICAL: without it the background server inherits the
+    # plugin's stdin pipe, Stash waits for its EOF forever and the whole
+    # GraphQL queue wedges (terminal 'connecting...', explorer dead)
+    nohup "$PYEXE" "$DIR/server.py" >/dev/null 2>&1 < /dev/null &
     for i in $(seq 1 30); do
         if [ -f "$PORT_FILE" ]; then
             P2=$(cat "$PORT_FILE" 2>/dev/null)
