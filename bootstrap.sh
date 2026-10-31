@@ -53,6 +53,15 @@ print(json.dumps({'output': {'cwd': os.getcwd(), 'user': os.environ.get('USER','
     exit 0
 fi
 
+# 'interrupt' -- kill the running foreground command via the terminal server
+if [ "$ACTION" = "interrupt" ]; then
+    if [ "$SERVER_UP" = true ] && [ -n "$PORT" ]; then
+        $PYEXE -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:$PORT/interrupt', data=b'', timeout=5)" 2>/dev/null
+    fi
+    echo '{"output":{"ok":true}}'
+    exit 0
+fi
+
 # Forward 'exec' and other actions
 if [ "$ACTION" = "exec" ]; then
     if [ "$SERVER_UP" = true ] && [ -n "$PORT" ]; then
@@ -67,7 +76,7 @@ else:
     print(json.dumps({'cmd': ''}, separators=(',',':')))
 " 2>/dev/null)
         RESP=$($PYEXE -c "
-import urllib.request, json
+import sys, urllib.request, json
 data = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
 req = urllib.request.Request('http://127.0.0.1:$PORT/execute', data=json.dumps(data).encode(), headers={'Content-Type': 'application/json'}, method='POST')
 with urllib.request.urlopen(req, timeout=600) as r:
@@ -75,8 +84,8 @@ with urllib.request.urlopen(req, timeout=600) as r:
 " "$SERVER_BODY" 2>/dev/null)
         if [ -n "$RESP" ]; then
             $PYEXE -c "
-import json, os
-print(json.dumps({'output': {'out': json.loads(sys.argv[1]) if sys.argv[1] else '', 'err': '', 'code': 0, 'cwd': os.getcwd()}}, separators=(',',':)))
+import sys, json, os
+print(json.dumps({'output': {'out': sys.argv[1], 'err': '', 'code': 0, 'cwd': os.getcwd()}}, separators=(',',':')))
 " "$RESP" 2>/dev/null
         else
             echo '{"output":{"out":"","err":"no response from server","code":1,"cwd":""}}'
