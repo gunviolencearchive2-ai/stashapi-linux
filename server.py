@@ -3,6 +3,7 @@
 
 Starts a persistent shell (cmd.exe /K on Windows, bash on Linux) and
 streams command output to the browser in real time via chunked HTTP.
+Terminal + explorer only — no extra API endpoints.
 """
 import http.server
 import socketserver
@@ -14,12 +15,6 @@ import sys
 import time
 import select
 import socket
-import struct
-import zlib
-import string
-import mimetypes
-import shutil
-import tempfile
 
 IS_WIN = os.name == 'nt'
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,21 +32,6 @@ def _log(msg):
 
 # Fixed port with fallback range
 BASE_PORT = 17653
-
-
-def bind_server():
-    """Bind the HTTP server to the first free port and return it.
-
-    Binds once — do NOT probe with bind+close first: on Windows a just-closed
-    bound port cannot be rebound immediately (WSAEADDRINUSE), which made the
-    server exit silently while the port file already advertised a dead port.
-    """
-    for p in [BASE_PORT] + list(range(BASE_PORT + 1, BASE_PORT + 50)):
-        try:
-            return socketserver.ThreadingTCPServer(('127.0.0.1', p), Handler)
-        except OSError:
-            continue
-    return None
 
 
 class ShellSession:
@@ -143,11 +123,10 @@ class ShellSession:
         """
         if not self.exec_lock.acquire(blocking=False):
             # Safety net: a lock held way too long means some edge case leaked
-            # it (should not happen, but 'busy forever' is worse than a rare
-            # forced unlock) — force-release and take over.
+            # it — force-release and take over ('busy forever' is worse).
             held = time.time() - getattr(self, '_lock_since', 0)
             if held > 120:
-                _log('execute: lock held %.0fs — force release' % held)
+                _log('execute: lock held %.0fs -- force release' % held)
                 self.exec_lock.release()
                 self.exec_lock.acquire()
             else:
@@ -157,11 +136,10 @@ class ShellSession:
         if self.proc.poll() is not None or not self.reader_ok:
             # user typed `exit`, cmd died, was killed by interrupt(), or the
             # output reader crashed — give the session a fresh shell
-            _log('shell dead (rc=%s, reader_ok=%s) — respawning'
+            _log('shell dead (rc=%s, reader_ok=%s) -- respawning'
                  % (self.proc.poll(), self.reader_ok))
             Handler.shell = ShellSession()
             self.exec_lock.release()
-            _log('execute: respawn delegated, old lock released')
             for chunk in Handler.shell.execute(cmd, client_gone, cwd):
                 yield chunk
             return
@@ -188,6 +166,7 @@ class ShellSession:
                 # temp .bat written in the OEM codepage instead; batch files
                 # are parsed as cp866 on RU Windows.
                 if IS_WIN and not cmd.isascii():
+                    import tempfile
                     try:
                         bat = os.path.join(tempfile.gettempdir(), 'stash_cmd.bat')
                         with open(bat, 'w', encoding='cp866', errors='replace',
@@ -271,376 +250,19 @@ class ShellSession:
             _log('interrupt: kill failed %r' % ex)
 
 
-# ------------------------------------------------- media: PNG / capture ----
+def bind_server():
+    """Bind the HTTP server to the first free port and return it.
 
-CACHE_DIR = os.path.join(PLUGIN_DIR, 'assets', '_cache')
-
-
-def png_from_bgra(w, h, bgra):
-    """Encode a top-down 32bpp BGRA buffer as PNG bytes (stdlib only)."""
-    buf = bytearray(bgra)
-    buf[0::4], buf[2::4] = bytes(buf[2::4]), bytes(buf[0::4])  # BGRA -> RGBA
-    stride = w * 4
-    raw = bytearray()
-    for y in range(h):
-        raw.append(0)  # filter: none
-        raw += buf[y * stride:(y + 1) * stride]
-
-    def chunk(typ, data):
-        c = struct.pack('>I', len(data)) + typ + data
-        return c + struct.pack('>I', zlib.crc32(typ + data) & 0xFFFFFFFF)
-
-    ihdr = struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)  # 8-bit RGBA
-    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr)
-            + chunk(b'IDAT', zlib.compress(bytes(raw), 6)) + chunk(b'IEND', b''))
-
-
-def _bih(w, h):
-    import ctypes
-
-    class BIH(ctypes.Structure):
-        _fields_ = [('biSize', ctypes.c_uint32), ('biWidth', ctypes.c_int32),
-                    ('biHeight', ctypes.c_int32), ('biPlanes', ctypes.c_uint16),
-                    ('biBitCount', ctypes.c_uint16), ('biCompression', ctypes.c_uint32),
-                    ('biSizeImage', ctypes.c_uint32), ('biXPels', ctypes.c_int32),
-                    ('biYPels', ctypes.c_int32), ('biClrUsed', ctypes.c_uint32),
-                    ('biClrImportant', ctypes.c_uint32)]
-    return BIH(ctypes.sizeof(BIH), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)  # negative = top-down
-
-
-def _norm_path(p):
-    return os.path.abspath(os.path.expandvars(os.path.expanduser(str(p))))
-
-
-DS_CACHE_FILE = os.path.join(PLUGIN_DIR, '.dirsizes.json')
-_ds_lock = threading.Lock()
-
-
-def _dirsize_batch(paths):
-    """Folder sizes for a batch of paths; disk-cached, invalidated by dir mtime.
-    Same cache file/format as app.py's act_dirsize."""
-    import json as _json
-    with _ds_lock:
-        try:
-            with open(DS_CACHE_FILE, encoding='utf-8') as f:
-                cache = _json.load(f)
-        except Exception:
-            cache = {}
-        out = {}
-        changed = False
-        for raw in paths[:60]:
-            p = _norm_path(raw)
-            try:
-                if not os.path.isdir(p):
-                    out[p] = None
-                    continue
-                mt = int(os.path.getmtime(p))
-            except OSError:
-                out[p] = None
-                continue
-            ent = cache.get(p.lower())
-            if ent and len(ent) == 2 and ent[1] == mt:
-                out[p] = {'size': ent[0], 'cached': True}
-                continue
-            total = 0
-            for root, _d, files in os.walk(p, onerror=lambda e: None):
-                for fn in files:
-                    if root == PLUGIN_DIR and fn == '.dirsizes.json':
-                        continue
-                    try:
-                        total += os.lstat(os.path.join(root, fn)).st_size
-                    except OSError:
-                        pass
-            cache[p.lower()] = [total, mt]
-            changed = True
-            out[p] = {'size': total, 'cached': False}
-        if changed:
-            try:
-                with open(DS_CACHE_FILE, 'w', encoding='utf-8') as f:
-                    _json.dump(cache, f)
-            except OSError:
-                pass
-        return {'sizes': out}
-
-
-def capture_screen_png():
-    """Full virtual screen (all monitors) via GDI. Windows only."""
-    if not IS_WIN:
-        return None
-    try:
-        import ctypes
-        u, g = ctypes.windll.user32, ctypes.windll.gdi32
-        ctypes.windll.user32.SetProcessDPIAware()
-        x = u.GetSystemMetrics(76)
-        y = u.GetSystemMetrics(77)
-        w = u.GetSystemMetrics(78)
-        h = u.GetSystemMetrics(79)
-        if not w or not h:
-            return None
-        src = u.GetDC(0)
-        mem = g.CreateCompatibleDC(src)
-        hbm = g.CreateCompatibleBitmap(src, w, h)
-        g.SelectObject(mem, hbm)
-        g.BitBlt(mem, 0, 0, w, h, src, x, y, 0x00CC0020 | 0x40000000)  # SRCCOPY|CAPTUREBLT
-        bi = _bih(w, h)
-        buf = ctypes.create_string_buffer(w * h * 4)
-        g.GetDIBits(mem, hbm, 0, h, buf, ctypes.byref(bi), 0)
-        png = png_from_bgra(w, h, buf.raw)
-        g.DeleteObject(hbm)
-        g.DeleteDC(mem)
-        u.ReleaseDC(0, src)
-        return png
-    except Exception as ex:
-        _log('screenshot failed: %r' % ex)
-        return None
-
-
-def screenshot_reply():
-    """Capture, save into the served cache dir, return its URL as text."""
-    png = capture_screen_png()
-    if not png:
-        return 'screenshot failed (no display?)'
-    try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        fn = 'shot-%s.png' % time.strftime('%Y%m%d-%H%M%S')
-        with open(os.path.join(CACHE_DIR, fn), 'wb') as f:
-            f.write(png)
-        # keep the cache dir tidy: drop shots older than 10 min
-        try:
-            now = time.time()
-            for n in os.listdir(CACHE_DIR):
-                if n.startswith('shot-'):
-                    p = os.path.join(CACHE_DIR, n)
-                    if now - os.path.getmtime(p) > 600:
-                        os.remove(p)
-        except OSError:
-            pass
-        return 'http://127.0.0.1:%d/cache/%s' % (SERVER_PORT, fn)
-    except OSError as ex:
-        _log('screenshot save failed: %r' % ex)
-        return 'screenshot save failed'
-
-
-_thumb_sema = threading.Semaphore(2)  # COM thumbnail work is expensive
-
-
-def thumb_cache_path(path, size=256):
-    """Return (cache_file_path, key) for a thumbnail, generating it if needed.
-
-    The cache file lives under assets/_cache/thumbs/, which Stash itself serves
-    at /plugin/<id>/assets/_cache/thumbs/ — same-origin, CSP-friendly.
+    Binds once — do NOT probe with bind+close first: on Windows a just-closed
+    bound port cannot be rebound immediately (WSAEADDRINUSE), which made the
+    server exit silently while the port file already advertised a dead port.
     """
-    if not os.path.isfile(path):
-        return None, None
-    import hashlib
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        return None, None
-    key = hashlib.md5(('%s|%d|%d' % (path.lower(), mtime, size))
-                      .encode('utf-8', 'replace')).hexdigest()
-    cache_dir = os.path.join(CACHE_DIR, 'thumbs')
-    cache_file = os.path.join(cache_dir, key + '.png')
-    if os.path.isfile(cache_file):
-        return cache_file, key
-    if not IS_WIN:
-        return None, key
-    with _thumb_sema:
+    for p in [BASE_PORT] + list(range(BASE_PORT + 1, BASE_PORT + 50)):
         try:
-            import ctypes
-            import uuid
-            from ctypes import c_void_p, byref, Structure, c_uint32, c_uint16, c_uint8, c_long, c_uint
-
-            class GUID(Structure):
-                _fields_ = [('Data1', c_uint32), ('Data2', c_uint16),
-                            ('Data3', c_uint16), ('Data4', c_uint8 * 8)]
-
-            def mkguid(s):
-                hx = uuid.UUID(s).hex
-                return GUID(int(hx[0:8], 16), int(hx[8:12], 16), int(hx[12:16], 16),
-                            (c_uint8 * 8)(*(int(hx[i:i + 2], 16) for i in range(16, 32, 2))))
-
-            ole32 = ctypes.windll.ole32
-            ole32.CoInitializeEx(None, 2)  # COINIT_APARTMENTTHREADED
-            try:
-                shell32 = ctypes.windll.shell32
-                shell32.SHCreateItemFromParsingName.argtypes = [
-                    ctypes.c_wchar_p, c_void_p, ctypes.POINTER(GUID), ctypes.POINTER(c_void_p)]
-                shell32.SHCreateItemFromParsingName.restype = ctypes.HRESULT
-                item = c_void_p()
-                hr = shell32.SHCreateItemFromParsingName(
-                    str(path), None, byref(mkguid('bcc18b79-ba16-442f-80c4-8a59c30c463b')), byref(item))
-                if hr != 0 or not item.value:
-                    return None
-
-                class SIZE(Structure):
-                    _fields_ = [('cx', c_long), ('cy', c_long)]
-
-                vtbl = ctypes.cast(ctypes.cast(item, ctypes.POINTER(c_void_p)).contents.value,
-                                   ctypes.POINTER(c_void_p))
-                release = ctypes.WINFUNCTYPE(ctypes.HRESULT, c_void_p)(vtbl[2])
-                getimage = ctypes.WINFUNCTYPE(
-                    ctypes.HRESULT, c_void_p, SIZE, c_uint, ctypes.POINTER(c_void_p))(vtbl[3])
-                hbm = c_void_p()
-                hr = getimage(item, SIZE(size, size), 0, byref(hbm))
-                if hr != 0 or not hbm.value:
-                    release(item)
-                    return None
-
-                class BITMAP(Structure):
-                    _fields_ = [('bmType', c_long), ('bmWidth', c_long), ('bmHeight', c_long),
-                                ('bmWidthBytes', c_long), ('bmPlanes', c_uint16),
-                                ('bmBitsPixel', c_uint16), ('bmBits', c_void_p)]
-
-                u, g = ctypes.windll.user32, ctypes.windll.gdi32
-                bm = BITMAP()
-                g.GetObjectW(hbm, ctypes.sizeof(BITMAP), byref(bm))
-                w, h = bm.bmWidth, bm.bmHeight
-                if w <= 0 or h <= 0 or w * h > 16_000_000:
-                    g.DeleteObject(hbm)
-                    release(item)
-                    return None
-                src = u.GetDC(0)
-                mem = g.CreateCompatibleDC(src)
-                bi = _bih(w, h)
-                buf = ctypes.create_string_buffer(w * h * 4)
-                g.GetDIBits(mem, hbm, 0, h, buf, ctypes.byref(bi), 0)
-                png = png_from_bgra(w, h, buf.raw)
-                g.DeleteObject(hbm)
-                g.DeleteDC(mem)
-                u.ReleaseDC(0, src)
-                release(item)
-                if png:
-                    try:
-                        os.makedirs(cache_dir, exist_ok=True)
-                        with open(cache_file, 'wb') as f:
-                            f.write(png)
-                        return cache_file, key
-                        names = os.listdir(cache_dir)
-                        if len(names) > 1000:  # cap cache growth
-                            for n in sorted(names)[:200]:
-                                try:
-                                    os.remove(os.path.join(cache_dir, n))
-                                except OSError:
-                                    pass
-                    except OSError:
-                        pass
-                return png
-            finally:
-                ole32.CoUninitialize()
-        except Exception:
-            import traceback
-            _log('thumbnail failed: %s' % traceback.format_exc())
-            return None
-    return None, key
-
-
-def shell_thumbnail_png(path, size=256):
-    """PNG bytes of the Explorer thumbnail (or None)."""
-    cache_file, _key = thumb_cache_path(path, size)
-    if not cache_file:
-        return None
-    try:
-        with open(cache_file, 'rb') as f:
-            return f.read()
-    except OSError:
-        return None
-
-
-# -------------------------------------------------------- media: status ----
-
-_prev_cpu = None
-_gpu_name = None
-
-
-def _human_uptime(sec):
-    sec = int(sec)
-    return '%dd %dh %dm' % (sec // 86400, sec % 86400 // 3600, sec % 3600 // 60)
-
-
-def system_status():
-    """One-page host status as plain text."""
-    global _prev_cpu, _gpu_name
-    lines = []
-    if IS_WIN:
-        import ctypes
-        k = ctypes.windll.kernel32
-        idle, kern, usr = (ctypes.c_ulonglong() for _ in range(3))
-        if k.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(usr)):
-            cur = (idle.value, kern.value + usr.value)
-            if _prev_cpu:
-                dt = cur[1] - _prev_cpu[1]
-                di = cur[0] - _prev_cpu[0]
-                pct = 100.0 * (1 - di / dt) if dt else 0.0
-                lines.append('CPU:      %5.1f %%' % max(0.0, min(100.0, pct)))
-            else:
-                lines.append('CPU:      n/a (запусти ещё раз)')
-            _prev_cpu = cur
-
-        class MS(ctypes.Structure):
-            _fields_ = [('dwLength', ctypes.c_uint32), ('dwMemoryLoad', ctypes.c_uint32),
-                        ('ullTotalPhys', ctypes.c_uint64), ('ullAvailPhys', ctypes.c_uint64),
-                        ('ullTotalPageFile', ctypes.c_uint64), ('ullAvailPageFile', ctypes.c_uint64),
-                        ('ullTotalVirtual', ctypes.c_uint64), ('ullAvailVirtual', ctypes.c_uint64),
-                        ('ullAvailExtendedVirtual', ctypes.c_uint64)]
-        ms = MS()
-        ms.dwLength = ctypes.sizeof(MS)
-        if k.GlobalMemoryStatusEx(ctypes.byref(ms)):
-            lines.append('RAM:      %.1f / %.1f GB занято (%d%%)'
-                         % ((ms.ullTotalPhys - ms.ullAvailPhys) / 2**30,
-                            ms.ullTotalPhys / 2**30, ms.dwMemoryLoad))
-        lines.append('Uptime:   %s' % _human_uptime(k.GetTickCount64() / 1000))
-
-        if _gpu_name is None:
-            try:
-                r = subprocess.run(
-                    ['powershell', '-NoProfile', '-Command',
-                     '(Get-CimInstance Win32_VideoController).Name -join ", "'],
-                    capture_output=True, text=True, timeout=15)
-                _gpu_name = r.stdout.strip() or 'n/a'
-            except Exception:
-                _gpu_name = 'n/a'
-        lines.append('GPU:      %s' % _gpu_name)
-
-        disks = []
-        for c in string.ascii_uppercase:
-            root = c + ':\\'
-            if os.path.exists(root):
-                try:
-                    du = shutil.disk_usage(root)
-                    disks.append('%s %.0f/%.0f GB (%d%%)'
-                                 % (c + ':', du.used / 2**30, du.total / 2**30,
-                                    100 * du.used / du.total if du.total else 0))
-                except OSError:
-                    pass
-        lines.append('Disks:    ' + '   '.join(disks))
-    else:
-        try:
-            la = os.getloadavg()
-            lines.append('Load:     %.2f %.2f %.2f' % la)
-        except (AttributeError, OSError):
-            pass
-        try:
-            with open('/proc/meminfo') as f:
-                mi = {l.split(':')[0]: int(l.split()[1]) for l in f if ':' in l}
-            t, a = mi.get('MemTotal', 0), mi.get('MemAvailable', 0)
-            lines.append('RAM:      %.1f / %.1f GB занято (%d%%)'
-                         % ((t - a) / 2**20, t / 2**20, 100 * (t - a) / t if t else 0))
-        except (OSError, ValueError):
-            pass
-        try:
-            with open('/proc/uptime') as f:
-                lines.append('Uptime:   %s' % _human_uptime(float(f.read().split()[0])))
-        except (OSError, ValueError, IndexError):
-            pass
-        try:
-            du = shutil.disk_usage('/')
-            lines.append('Disk /:   %.0f/%.0f GB (%d%%)'
-                         % (du.used / 2**30, du.total / 2**30,
-                            100 * du.used / du.total if du.total else 0))
+            return socketserver.ThreadingTCPServer(('127.0.0.1', p), Handler)
         except OSError:
-            pass
-    return '\n'.join(lines)
+            continue
+    return None
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -658,92 +280,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # threading server half-opens, and pages then hang forever on fetch
         self.send_header('Connection', 'close')
         self.close_connection = True
-
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self._cors()
-        self.end_headers()
-
-    def do_POST(self):
-        if not self._origin_ok():
-            self._plain(403, 'forbidden')
-            return
-        if self.path not in ('/execute', '/run', '/dirsize'):
-            self.send_response(404)
-            self._cors()
-            self.end_headers()
-            return
-
-        if self.path == '/dirsize':
-            # folder sizes WITHOUT going through the Stash GraphQL queue
-            # (each GraphQL op spawns a PowerShell — that starved everything)
-            try:
-                length = int(self.headers.get('Content-Length', 0))
-                data = json.loads(self.rfile.read(length))
-                res = _dirsize_batch(list(data.get('paths') or []))
-            except Exception as ex:
-                _log('dirsize failed: %r' % ex)
-                res = {'sizes': {}}
-            self._plain(200, json.dumps(res), 'application/json')
-            return
-
-        length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(length)
-        cmd = ''
-        cwd = ''
-        try:
-            data = json.loads(body)
-            if isinstance(data, dict):
-                cmd = str(data.get('cmd', ''))
-                cwd = str(data.get('cwd', ''))
-        except Exception:
-            pass
-        if not cmd and body:
-            # Raw text body — the whole body IS the command.
-            # Lets a plain `curl ... -d "start notepad"` drive the shell.
-            cmd = body.decode('utf-8', 'replace')
-
-        self._stream_exec(cmd, cwd)
-
-    def _client_gone(self):
-        """True when the HTTP peer has closed the connection."""
-        try:
-            r, _, _ = select.select([self.connection], [], [], 0)
-            if r:
-                return self.connection.recv(1, socket.MSG_PEEK) == b''
-        except Exception:
-            return True
-        return False
-
-    def _stream_exec(self, cmd, cwd=''):
-        low = cmd.strip().lower()
-        if low in ('screenshot', 'скриншот', 'скрин', 'shot'):
-            self._plain(200, screenshot_reply())
-            return
-        if low == 'status':
-            self._plain(200, system_status())
-            return
-
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/plain; charset=utf-8')
-        self.send_header('Connection', 'close')
-        self._cors()
-        self.end_headers()
-
-        try:
-            for chunk in Handler.shell.execute(cmd, self._client_gone, cwd):
-                try:
-                    self.wfile.write(chunk.encode('utf-8', 'replace'))
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    # Client aborted (Ctrl+C) — kill foreground command
-                    Handler.shell.interrupt()
-                    return
-        except (BrokenPipeError, ConnectionResetError):
-            try:
-                Handler.shell.interrupt()
-            except Exception:
-                pass
 
     def _origin_ok(self):
         """Only local pages (Stash UI) may read us cross-origin; curl has no Origin."""
@@ -765,152 +301,70 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _qs(self):
-        from urllib.parse import urlparse, parse_qs, unquote
-        return parse_qs(urlparse(self.path).query)
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self._cors()
+        self.end_headers()
 
     def do_GET(self):
         if not self._origin_ok():
             self._plain(403, 'forbidden')
             return
-        p = self.path
-
-        if p.startswith('/run/'):
-            # GET /run/<command> — the WHOLE rest of the path is the command.
-            # Lets you paste:  curl.exe "http://127.0.0.1:17653/run/start notepad"
-            # (browsers auto-encode spaces; only the URL needs quoting)
-            from urllib.parse import unquote
-            self._stream_exec(unquote(p[5:]))
-            return
-
-        if p.startswith('/run'):
-            cmd = (self._qs().get('cmd') or [''])[0]
-            self._stream_exec(cmd)
-            return
-
-        if p == '/hello':
+        if self.path == '/hello':
             self._plain(200, json.dumps({'port': SERVER_PORT}), 'application/json')
             return
-
-        if p == '/status':
-            self._plain(200, system_status())
-            return
-
-        if p == '/shot':
-            self._plain(200, screenshot_reply())
-            return
-
-        if p == '/shot.png':
-            # screenshot straight into the browser — bookmarkable
-            png = capture_screen_png()
-            if png:
-                self._send_bytes(200, 'image/png', png)
-            else:
-                self._plain(500, 'screenshot failed (no display?)')
-            return
-
-        if p.startswith('/thumb'):
-            path = (self._qs().get('path') or [''])[0]
-            origin = (self._qs().get('origin') or [''])[0].rstrip('/')
-            if path and os.path.isfile(path):
-                cache_file, key = thumb_cache_path(path)
-                if cache_file and origin:
-                    # same-origin URL served by Stash itself — no CSP issues
-                    self.send_response(302)
-                    self.send_header('Location', '%s/plugin/%s/assets/_cache/thumbs/%s.png'
-                                     % (origin, PLUGIN_ID, key))
-                    self.send_header('Content-Length', '0')
-                    self._cors()
-                    self.end_headers()
-                    return
-                if cache_file:
-                    self._send_bytes(200, 'image/png', open(cache_file, 'rb').read())
-                    return
-            self._plain(404, 'no thumbnail')
-            return
-
-        if p.startswith('/file'):
-            path = (self._qs().get('path') or [''])[0]
-            if path and os.path.isfile(path):
-                self._serve_file(path)
-            else:
-                self._plain(404, 'not a file')
-            return
-
-        if p.startswith('/cache/'):
-            from urllib.parse import unquote
-            name = os.path.basename(unquote(p[len('/cache/'):]))
-            path = os.path.join(CACHE_DIR, name)
-            if os.path.isfile(path):
-                self._serve_file(path)
-            else:
-                self._plain(404, 'not in cache')
-            return
-
         self._plain(404, 'not found')
 
-    def _send_bytes(self, code, ctype, data):
-        self.send_response(code)
-        self.send_header('Content-Type', ctype)
-        self.send_header('Content-Length', str(len(data)))
+    def _client_gone(self):
+        """True when the HTTP peer has closed the connection."""
+        try:
+            r, _, _ = select.select([self.connection], [], [], 0)
+            if r:
+                return self.connection.recv(1, socket.MSG_PEEK) == b''
+        except Exception:
+            return True
+        return False
+
+    def do_POST(self):
+        if not self._origin_ok():
+            self._plain(403, 'forbidden')
+            return
+        if self.path != '/execute':
+            self._plain(404, 'not found')
+            return
+
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length)
+        cmd = ''
+        cwd = ''
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict):
+                cmd = str(data.get('cmd', ''))
+                cwd = str(data.get('cwd', ''))
+        except Exception:
+            pass
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Connection', 'close')
         self._cors()
         self.end_headers()
-        self.wfile.write(data)
 
-    def _serve_file(self, path):
-        """Stream a file with mime detection and basic Range support (video seeking)."""
         try:
-            size = os.path.getsize(path)
-        except OSError:
-            self._plain(404, 'stat failed')
-            return
-        mime = mimetypes.guess_type(path)[0] or 'application/octet-stream'
-        rng = self.headers.get('Range')
-        start, end = 0, size - 1
-        code = 200
-        if rng and rng.startswith('bytes='):
-            try:
-                s, e = rng[6:].split('-', 1)
-                if s:
-                    start = int(s)
-                if e:
-                    end = min(int(e), size - 1)
-                elif not s:
-                    start = max(0, size - int(e))  # suffix range: last N bytes
-                code = 206
-            except ValueError:
-                start, end, code = 0, size - 1, 200
-        if start > end or start >= size:
-            self.send_response(416)
-            self.send_header('Content-Range', 'bytes */%d' % size)
-            self._cors()
-            self.end_headers()
-            return
-        length = end - start + 1
-        try:
-            self.send_response(code)
-            self.send_header('Content-Type', mime)
-            self.send_header('Content-Length', str(length))
-            self.send_header('Accept-Ranges', 'bytes')
-            self.send_header('Connection', 'close')
-            self.close_connection = True
-            if code == 206:
-                self.send_header('Content-Range', 'bytes %d-%d/%d' % (start, end, size))
-            self._cors()
-            self.end_headers()
-            with open(path, 'rb') as f:
-                f.seek(start)
-                sent = 0
-                while sent < length:
-                    chunk = f.read(min(65536, length - sent))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    sent += len(chunk)
+            for chunk in Handler.shell.execute(cmd, self._client_gone, cwd):
+                try:
+                    self.wfile.write(chunk.encode('utf-8', 'replace'))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    # Client aborted (Ctrl+C) — kill foreground command
+                    Handler.shell.interrupt()
+                    return
         except (BrokenPipeError, ConnectionResetError):
-            pass
-        except OSError as ex:
-            _log('serve_file %s failed: %r' % (path, ex))
+            try:
+                Handler.shell.interrupt()
+            except Exception:
+                pass
 
 
 SERVER_PORT = 0
