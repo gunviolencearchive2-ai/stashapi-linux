@@ -192,7 +192,9 @@ function rowHtml(it) {
   return '<tr>' +
     '<td><a data-act="open" data-name="' + attr(it.name) + '" data-dir="' + (it.dir ? '1' : '0') + '"' + cls + '>' +
       icon + esc(it.name) + '</a></td>' +
-    '<td class="size">' + fmtSize(it.size) + '</td>' +
+    '<td class="size">' + (it.dir
+      ? '<span class="dsize" data-p="' + attr(joinPath(current, it.name)) + '">…</span>'
+      : fmtSize(it.size)) + '</td>' +
     '<td class="date">' + fmtDate(it.mtime) + '</td>' +
     '<td class="act">' +
       '<a data-act="' + act + '" data-name="' + attr(it.name) + '" data-dir="' + (it.dir ? '1' : '0') + '">' +
@@ -221,6 +223,35 @@ function paint(append) {
   footEl.style.display = left > 0 ? '' : 'none';
   if (left > 0) moreEl.textContent = 'показать ещё ' + Math.min(left, CHUNK) + ' (осталось ' + left + ')';
   else if (shown > 0) setStatus(shown + ' элементов' + (items.length !== allItems.length ? ' (отфильтровано из ' + allItems.length + ')' : ''));
+  fillDirSizes();
+}
+
+// --------------------------------------------- async folder size fill ----
+
+let dsToken = 0;
+function fillDirSizes() {
+  const tok = ++dsToken;
+  const spans = Array.prototype.slice.call(listEl.querySelectorAll('span.dsize[data-p]'));
+  let i = 0;
+  (async function next() {
+    if (tok !== dsToken) return;  // navigated away / repainted
+    if (i >= spans.length) return;
+    const batch = spans.slice(i, i + 5);
+    i += 5;
+    const paths = batch.map(function (s) { return s.dataset.p; });
+    try {
+      const res = await op({ action: 'dirsize', paths: paths });
+      const sizes = (res && res.sizes) || {};
+      if (tok !== dsToken) return;
+      batch.forEach(function (s) {
+        const v = sizes[s.dataset.p];
+        s.textContent = v ? fmtSize(v.size) : '—';
+      });
+    } catch (e) {
+      if (tok === dsToken) batch.forEach(function (s) { s.textContent = '—'; });
+    }
+    setTimeout(next, 30);
+  })();
 }
 
 async function load(p) {
