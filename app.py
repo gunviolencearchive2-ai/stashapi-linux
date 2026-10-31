@@ -312,28 +312,6 @@ def act_exec():
     return res
 
 
-def folder_size(path):
-    # Ask the OS for the directory size; never walk recursively in Python.
-    try:
-        if IS_WIN:
-            cmd = ["powershell", "-NoProfile", "-Command",
-                   "(Get-ChildItem -LiteralPath '%s' -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum" % path.replace("'", "''")]
-        else:
-            cmd = ["du", "-sb", path]
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        if out.returncode == 0:
-            txt = (out.stdout or "").strip()
-            if IS_WIN:
-                num = txt.splitlines()[-1].strip() if txt else ""
-            else:
-                num = txt.split()[0] if txt else ""
-            if num.isdigit():
-                return int(num)
-    except Exception:
-        pass
-    return 0
-
-
 def act_list():
     path = norm(ARGS.get('path'))
     if not os.path.isdir(path):
@@ -364,69 +342,6 @@ def act_list():
     parent = os.path.dirname(path)
     return {'path': path, 'parent': None if parent == path else parent,
             'items': items, 'drives': drives()}
-
-
-# ------------------------------------------------------- folder sizes ----
-
-DS_CACHE_FILE = os.path.join(PLUGIN_DIR, '.dirsizes.json')
-
-
-def _ds_load():
-    try:
-        with open(DS_CACHE_FILE, encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _ds_save(cache):
-    try:
-        with open(DS_CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(cache, f)
-    except OSError:
-        pass
-
-
-def act_dirsize():
-    """Sizes for a batch of folders. Recursive walk, but:
-    - disk-cached (invalidated by the folder's own mtime),
-    - called from the UI in small background batches, so `list` stays instant.
-    """
-    paths = ARGS.get('paths') or []
-    if isinstance(paths, str):
-        paths = [paths]
-    cache = _ds_load()
-    out = {}
-    changed = False
-    for raw in paths[:60]:
-        p = norm(raw)
-        try:
-            if not os.path.isdir(p):
-                out[p] = None
-                continue
-            mt = int(os.path.getmtime(p))
-        except OSError:
-            out[p] = None
-            continue
-        ent = cache.get(p.lower())
-        if ent and len(ent) == 2 and ent[1] == mt:
-            out[p] = {'size': ent[0], 'cached': True}
-            continue
-        total = 0
-        for root, _dirs, files in os.walk(p, onerror=lambda e: None):
-            for fn in files:
-                if root == PLUGIN_DIR and fn == '.dirsizes.json':
-                    continue  # don't measure the cache itself
-                try:
-                    total += os.lstat(os.path.join(root, fn)).st_size
-                except OSError:
-                    pass
-        cache[p.lower()] = [total, mt]
-        changed = True
-        out[p] = {'size': total, 'cached': False}
-    if changed:
-        _ds_save(cache)
-    return {'sizes': out}
 
 
 def act_mkdir():
@@ -503,7 +418,7 @@ def act_download():
 
 HANDLERS = {
     'hello': act_hello, 'reset': act_reset, 'exec': act_exec,
-    'list': act_list, 'dirsize': act_dirsize, 'mkdir': act_mkdir, 'delete': act_delete,
+    'list': act_list, 'mkdir': act_mkdir, 'delete': act_delete,
     'rename': act_rename, 'upload': act_upload,
 }
 
