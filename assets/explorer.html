@@ -93,6 +93,7 @@ function parseRes(r) {
 }
 const CHUNK = 300;
 let PATH_SEP = '/';
+let SRV = null;  // terminal server base, e.g. http://127.0.0.1:17653
 
 const IMG_EXT = ['jpg','jpeg','png','gif','webp','bmp','ico','avif','jfif'];
 const VID_EXT = ['mp4','mkv','webm','avi','mov','m4v','wmv','flv','ts'];
@@ -491,6 +492,7 @@ listEl.addEventListener('drop', async function (e) {
   try {
     const info = await op({ action: 'hello' });
     if (info && info.sep) PATH_SEP = info.sep;
+    if (info && info.server_port) SRV = 'http://127.0.0.1:' + info.server_port;
     const defPath = info && info.cwd ? info.cwd : (PATH_SEP === '\\' ? 'C:\\' : '/');
     load(defPath);
   } catch (e) {
