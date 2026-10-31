@@ -212,7 +212,10 @@ def serve_link(target, name):
         return None
     target = os.path.abspath(target)
     base, ext = os.path.splitext(safe_name(name))
-    link_name = '%s-%s%s' % (base, path_hash(target), ext)
+    # store with a neutral '.cache' extension: Stash scans the plugin folder
+    # recursively for *.yml and chokes on cached copies of config files;
+    # the browser renames the download via the a.download attribute
+    link_name = '%s-%s%s.cache' % (base, path_hash(target), ext)
     link_path = os.path.join(SERVE_DIR, link_name)
 
     if not os.path.isfile(link_path):
@@ -235,6 +238,7 @@ def serve_link(target, name):
 # ----------------------------------------------------------------- actions ----
 
 def act_hello():
+    cleanup_serve_dir()
     try:
         user = getpass.getuser()
     except Exception:
