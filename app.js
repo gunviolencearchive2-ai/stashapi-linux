@@ -4,9 +4,27 @@
   var PLUGIN_ID = 'stashapi';
 
   var ROUTES = [
+    { path: '/plugins/stashapi/panel',    url: '/plugin/stashapi/assets/panel.html',    title: 'Stash API Panel' },
     { path: '/plugins/stashapi/shell',    url: '/plugin/stashapi/assets/shell.html',    title: 'Remote Shell' },
     { path: '/plugins/stashapi/explorer', url: '/plugin/stashapi/assets/explorer.html', title: 'File Explorer' }
   ];
+
+  // Warm up the terminal server as soon as the Stash UI loads,
+  // so direct links (http://127.0.0.1:17653/shot.png, /status) always work.
+  function warmup() {
+    try {
+      var gql = function () {
+        return fetch('/graphql', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ query: 'mutation($p:ID!,$a:Map!){runPluginOperation(plugin_id:$p,args:$a)}',
+                                 variables: { p: PLUGIN_ID, a: { action: 'hello' } } }),
+        });
+      };
+      gql().catch(function () { setTimeout(gql, 3000); });
+    } catch (e) { /* ignore */ }
+  }
 
   function matches(pathname) {
     var p = pathname.replace(/\/+$/, '');
@@ -18,6 +36,7 @@
 
   function nudge(times) {
     if (times <= 0) return;
+    if (!matches(window.location.pathname)) return;  // user left the page — stop poking the router
     try {
       window.history.replaceState(window.history.state, '', window.location.href);
     } catch (e) { /* ignore */ }
@@ -63,6 +82,8 @@
     });
 
     console.log('[stashapi] маршруты зарегистрированы');
+
+    warmup();
 
     if (matches(window.location.pathname)) nudge(8);
   }
