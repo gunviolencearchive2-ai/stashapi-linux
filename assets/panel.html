@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Stash API Panel</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #12141a; color: #dcdfe6;
+               font: 13px/1.45 "Segoe UI", system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #bar { display: flex; gap: 8px; align-items: center; padding: 8px 12px;
+         background: #1b1e26; border-bottom: 1px solid #2b2f3a; flex-wrap: wrap; }
+  #bar b { color: #61afef; margin-right: 6px; }
+  button { background: #2b2f3a; color: #dcdfe6; border: 1px solid #3a4050;
+           border-radius: 4px; padding: 4px 10px; cursor: pointer; font: inherit; }
+  button:hover { background: #363b48; }
+  button.on { border-color: #61afef; color: #61afef; }
+  select { background: #0f1116; color: #dcdfe6; border: 1px solid #3a4050;
+           border-radius: 4px; padding: 4px 6px; font: inherit; }
+  #stat { flex: 1 1 260px; overflow: auto; padding: 10px 12px; white-space: pre;
+          font: 12.5px/1.55 Consolas, "Cascadia Mono", monospace; color: #98c379; }
+  #wrap { flex: 3; overflow: auto; text-align: center; padding: 8px;
+          background: #0f1116; border-top: 1px solid #2b2f3a; }
+  #wrap img { max-width: 100%; max-height: 100%; border: 1px solid #2b2f3a;
+              border-radius: 4px; }
+  #srv { color: #8b93a3; }
+  #err { color: #e06c75; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <b>Stash API</b>
+  <button id="b1s">скрин 1с</button>
+  <button id="b2s">2с</button>
+  <button id="b5s">5с</button>
+  <button id="bnow" class="on">скрин вручную</button>
+  <button id="bshot">обновить скрин</button>
+  <button id="bstat">обновить статус</button>
+  <span id="srv"></span>
+</div>
+<div id="stat">подключение…</div>
+<div id="wrap"><img id="shot" alt="скриншот"></div>
+<script>
+const PLUGIN = location.pathname.split('/')[2] || 'stashapi';
+const QUERY = 'mutation($p:ID!,$a:Map!){runPluginOperation(plugin_id:$p,args:$a)}';
+const statEl = document.getElementById('stat');
+const srvEl = document.getElementById('srv');
+const shotEl = document.getElementById('shot');
+let SRV = null;
+let timer = null;
+
+async function op(args) {
+  const r = await fetch('/graphql', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ query: QUERY, variables: { p: PLUGIN, a: args } }),
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const j = await r.json();
+  if (j.errors && j.errors.length) throw new Error(j.errors.map(e => e.message).join('; '));
+  return j.data.runPluginOperation;
+}
+
+async function loadStatus() {
+  if (!SRV) return;
+  try {
+    const r = await fetch(SRV + '/status', { cache: 'no-store' });
+    const t = await r.text();
+    statEl.textContent = t;
+  } catch (e) { statEl.textContent = 'статус недоступен: ' + (e.message || e); }
+}
+
+function refreshShot() {
+  if (!SRV || document.hidden) return;  // don't burn CPU on a background tab
+  shotEl.src = SRV + '/shot.png?_t=' + Date.now();
+}
+
+shotEl.onerror = function () {
+  if (!document.getElementById('err')) {
+    const s = document.createElement('span');
+    s.id = 'err';
+    s.textContent = 'скрин недоступен';
+    document.getElementById('wrap').appendChild(s);
+  }
+};
+shotEl.onload = function () {
+  const e = document.getElementById('err');
+  if (e) e.remove();
+};
+
+function setTimer(sec, btn) {
+  clearInterval(timer);
+  timer = null;
+  document.querySelectorAll('#bar button').forEach(b => b.classList.remove('on'));
+  if (sec > 0) {
+    timer = setInterval(refreshShot, sec * 1000);
+    btn.classList.add('on');
+  } else {
+    document.getElementById('bnow').classList.add('on');
+  }
+}
+document.getElementById('b1s').onclick = function () { setTimer(1, this); refreshShot(); };
+document.getElementById('b2s').onclick = function () { setTimer(2, this); refreshShot(); };
+document.getElementById('b5s').onclick = function () { setTimer(5, this); refreshShot(); };
+document.getElementById('bnow').onclick = function () { setTimer(0, this); };
+document.getElementById('bshot').onclick = refreshShot;
+document.getElementById('bstat').onclick = loadStatus;
+
+setInterval(function () { if (!document.hidden) loadStatus(); }, 5000);
+
+(async function init() {
+  try {
+    const info = await op({ action: 'hello' });
+    if (info && info.server_port) {
+      SRV = 'http://127.0.0.1:' + info.server_port;
+      srvEl.textContent = 'сервер: ' + SRV;
+      loadStatus();
+      refreshShot();   // one static shot; live mode only via the 1s/2s/5s buttons
+    } else {
+      statEl.textContent = 'терминал-сервер не запущен — открой веб-терминал один раз';
+    }
+  } catch (e) {
+    statEl.textContent = 'плагин недоступен: ' + (e.message || e);
+  }
+})();
+</script>
+</body>
+</html>
