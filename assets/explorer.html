@@ -40,6 +40,22 @@
             border-top: 1px solid #2b2f3a; }
   #status.err { color: #e06c75; }
   #status.busy { color: #e5c07b; }
+  .thumb { width: 46px; height: 34px; object-fit: cover; border-radius: 3px;
+           vertical-align: middle; margin-right: 7px; background: #0f1116;
+           border: 1px solid #2b2f3a; }
+  #list.drop { outline: 2px dashed #61afef; outline-offset: -8px; }
+  #ov { position: fixed; inset: 0; background: rgba(0,0,0,.82); display: none;
+        align-items: center; justify-content: center; z-index: 100; }
+  #ov.on { display: flex; }
+  #ovc { max-width: 94vw; max-height: 92vh; overflow: auto; background: #12141a;
+         border: 1px solid #2b2f3a; border-radius: 6px; padding: 10px; position: relative; }
+  #ovc img { max-width: 90vw; max-height: 84vh; display: block; }
+  #ovc video { max-width: 90vw; max-height: 84vh; display: block; }
+  #ovc pre { max-width: 88vw; max-height: 80vh; overflow: auto; margin: 0;
+             font: 12px/1.45 Consolas, monospace; color: #dcdfe6; white-space: pre-wrap; }
+  #ovx { position: absolute; top: 6px; right: 10px; color: #8b93a3; cursor: pointer;
+         font: 16px sans-serif; z-index: 1; }
+  #ovx:hover { color: #dcdfe6; }
 </style>
 </head>
 <body>
@@ -80,6 +96,17 @@ function parseRes(r) {
 }
 const CHUNK = 300;
 let PATH_SEP = '/';
+let SRV = null;  // terminal server base, e.g. http://127.0.0.1:17653
+
+const IMG_EXT = ['jpg','jpeg','png','gif','webp','bmp','ico','avif','jfif'];
+const VID_EXT = ['mp4','mkv','webm','avi','mov','m4v','wmv','flv','ts'];
+const AUD_EXT = ['mp3','wav','ogg','flac','m4a','opus','wma'];
+const TXT_EXT = ['txt','log','json','xml','yml','yaml','ini','cfg','conf','md','py','js','html','css','bat','ps1','sh','csv','srt','nfo','vtt'];
+
+function extOf(n) {
+  const i = String(n).lastIndexOf('.');
+  return i < 0 ? '' : String(n).slice(i + 1).toLowerCase();
+}
 
 const listEl = document.getElementById('list');
 const drivesEl = document.getElementById('drives');
@@ -149,9 +176,22 @@ function visible() {
 function rowHtml(it) {
   const cls = it.dir ? ' class="dir"' : '';
   const act = it.dir ? 'download' : 'download';
+  let icon;
+  if (it.dir) {
+    icon = '📁 ';
+  } else {
+    const ext = extOf(it.name);
+    if (SRV && (IMG_EXT.indexOf(ext) !== -1 || VID_EXT.indexOf(ext) !== -1)) {
+      const tp = joinPath(current, it.name);
+      icon = '<img class="thumb" loading="lazy" alt="" src="' + attr(SRV + '/thumb?path=' + encodeURIComponent(tp)) +
+             '" onerror="this.outerHTML=\'📄 \'">';
+    } else {
+      icon = '📄 ';
+    }
+  }
   return '<tr>' +
     '<td><a data-act="open" data-name="' + attr(it.name) + '" data-dir="' + (it.dir ? '1' : '0') + '"' + cls + '>' +
-      (it.dir ? '📁 ' : '📄 ') + esc(it.name) + '</a></td>' +
+      icon + esc(it.name) + '</a></td>' +
     '<td class="size">' + fmtSize(it.size) + '</td>' +
     '<td class="date">' + fmtDate(it.mtime) + '</td>' +
     '<td class="act">' +
@@ -294,11 +334,53 @@ listEl.addEventListener('click', function (ev) {
   const isDir = a.dataset.dir === '1';
   const act = a.dataset.act;
 
-  if (act === 'open') { if (isDir) load(full); else download(full, name, false, ev.shiftKey); }
+  if (act === 'open') { if (isDir) load(full); else previewFile(full, name); }
   else if (act === 'download') download(full, name, isDir, ev.shiftKey);
   else if (act === 'rename') rename(full, name);
   else if (act === 'delete') remove(full, name);
 });
+
+// ------------------------------------------------------------- preview ----
+
+function showPreview(inner) {
+  let ov = document.getElementById('ov');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.id = 'ov';
+    ov.innerHTML = '<div id="ovc"><span id="ovx" title="закрыть">✕</span><div id="ovb"></div></div>';
+    document.body.appendChild(ov);
+    ov.addEventListener('click', function (e) { if (e.target === ov) closePreview(); });
+    document.getElementById('ovx').onclick = closePreview;
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closePreview(); });
+  }
+  document.getElementById('ovb').innerHTML = inner;
+  ov.classList.add('on');
+}
+function closePreview() {
+  const ov = document.getElementById('ov');
+  if (ov) { ov.classList.remove('on'); document.getElementById('ovb').innerHTML = ''; }
+}
+
+function previewFile(path, name) {
+  const ext = extOf(name);
+  if (!SRV) { download(path, name, false, false); return; }  // no terminal server — fall back to download
+  const url = SRV + '/file?path=' + encodeURIComponent(path);
+  if (IMG_EXT.indexOf(ext) !== -1) { showPreview('<img src="' + attr(url) + '" alt="' + attr(name) + '">'); return; }
+  if (VID_EXT.indexOf(ext) !== -1) { showPreview('<video controls autoplay src="' + attr(url) + '"></video>'); return; }
+  if (AUD_EXT.indexOf(ext) !== -1) { showPreview('<p style="color:#dcdfe6">' + esc(name) + '</p><audio controls autoplay src="' + attr(url) + '"></audio>'); return; }
+  if (TXT_EXT.indexOf(ext) !== -1) {
+    setStatus('читаю ' + name + '…');
+    fetch(url).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+      .then(function (t) {
+        const cut = t.length > 300000;
+        showPreview('<pre>' + esc(cut ? t.slice(0, 300000) : t) + (cut ? '\n… (обрезано)' : '') + '</pre>');
+        setStatus('');
+      })
+      .catch(function (e) { setStatus('превью не удалось: ' + (e.message || e), 'err'); });
+    return;
+  }
+  download(path, name, false, false);
+}
 
 drivesEl.addEventListener('click', function (ev) {
   const b = ev.target.closest('button[data-drive]');
@@ -327,28 +409,50 @@ document.getElementById('mkdir').onclick = async function () {
 };
 
 document.getElementById('upload').onclick = function () { document.getElementById('file').click(); };
-document.getElementById('file').onchange = function (ev) {
-  const f = ev.target.files[0];
-  if (!f) return;
+
+async function uploadFile(f) {
   if (f.size > BIG_WARN) setStatus('файл ' + fmtSize(f.size) + ' — заливаю через base64, это небыстро…', 'busy');
-  const fr = new FileReader();
-  fr.onload = async function () {
-    const b64 = String(fr.result).split(',')[1];
-    try {
-      setStatus('заливаю ' + f.name + '…', 'busy');
-      await op({ action: 'upload', path: current, name: f.name, data: b64 });
-      setStatus('загружено: ' + f.name);
-      load(current);
-    } catch (e) { setStatus('ошибка загрузки: ' + (e.message || e), 'err'); }
-  };
-  fr.readAsDataURL(f);
+  const b64 = await new Promise(function (res) {
+    const fr = new FileReader();
+    fr.onload = function () { res(String(fr.result).split(',')[1]); };
+    fr.readAsDataURL(f);
+  });
+  try {
+    setStatus('заливаю ' + f.name + '…', 'busy');
+    await op({ action: 'upload', path: current, name: f.name, data: b64 });
+    setStatus('загружено: ' + f.name);
+  } catch (e) { setStatus('ошибка загрузки: ' + (e.message || e), 'err'); }
+}
+
+document.getElementById('file').onchange = async function (ev) {
+  const files = Array.prototype.slice.call(ev.target.files);
   ev.target.value = '';
+  for (let i = 0; i < files.length; i++) await uploadFile(files[i]);
+  load(current);
 };
+
+// ---------------------------------------------------------- drag & drop ----
+
+['dragenter', 'dragover'].forEach(function (ev) {
+  listEl.addEventListener(ev, function (e) { e.preventDefault(); listEl.classList.add('drop'); });
+});
+listEl.addEventListener('dragleave', function (e) {
+  if (e.target === listEl) listEl.classList.remove('drop');
+});
+listEl.addEventListener('drop', async function (e) {
+  e.preventDefault();
+  listEl.classList.remove('drop');
+  const files = Array.prototype.slice.call(e.dataTransfer.files);
+  if (!files.length) return;
+  for (let i = 0; i < files.length; i++) await uploadFile(files[i]);
+  load(current);
+});
 
 (async function init() {
   try {
     const info = await op({ action: 'hello' });
     if (info && info.sep) PATH_SEP = info.sep;
+    if (info && info.server_port) SRV = 'http://127.0.0.1:' + info.server_port;
     const defPath = info && info.cwd ? info.cwd : (PATH_SEP === '\\' ? 'C:\\' : '/');
     load(defPath);
   } catch (e) {
