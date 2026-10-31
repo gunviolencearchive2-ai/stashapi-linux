@@ -183,9 +183,11 @@ function rowHtml(it) {
     const ext = extOf(it.name);
     if (SRV && (IMG_EXT.indexOf(ext) !== -1 || VID_EXT.indexOf(ext) !== -1)) {
       const tp = joinPath(current, it.name);
-      icon = '<img class="thumb" loading="lazy" alt="" src="' + attr(SRV + '/thumb?path=' + encodeURIComponent(tp) + '&origin=' + encodeURIComponent(location.origin)) +
-             '" onerror="this.outerHTML=\'📄 \'">';
-    } else {
+      if (it.tk) {
+        icon = '<img class="thumb" loading="lazy" alt="" data-path="' + attr(joinPath(current, it.name)) + '" src="/plugin/' + PLUGIN + '/assets/_cache/thumbs/' + it.tk + '.png" onerror="thumbFail(this)">';
+      } else {
+        icon = '📄 ';
+      }    } else {
       icon = '📄 ';
     }
   }
@@ -240,7 +242,13 @@ function fillDirSizes() {
     i += 5;
     const paths = batch.map(function (s) { return s.dataset.p; });
     try {
-      const res = await op({ action: 'dirsize', paths: paths });
+      // via the local server: a GraphQL op spawns a PowerShell and starves
+      // the whole Stash operation queue (that lagged everything)
+      const res = (SRV
+        ? await (await fetch(SRV + '/dirsize', { method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ paths: paths }) })).json()
+        : await op({ action: 'dirsize', paths: paths }));
       const sizes = (res && res.sizes) || {};
       if (tok !== dsToken) return;
       batch.forEach(function (s) {
@@ -278,6 +286,7 @@ async function load(p) {
     if (res.error) setStatus(res.error, 'err');
     else if (!allItems.length) setStatus('пусто');
     else if (shown >= allItems.length) setStatus(allItems.length + ' элементов');
+    else setStatus(shown + ' из ' + allItems.length + ' — есть ещё');
   } catch (e) {
     setStatus(String(e.message || e), 'err');
   }
@@ -371,6 +380,18 @@ listEl.addEventListener('click', function (ev) {
   else if (act === 'delete') remove(full, name);
 });
 
+function thumbFail(img) {
+  if (img.dataset.retried || !SRV) { img.outerHTML = '📄 '; return; }
+  img.dataset.retried = '1';
+  fetch(SRV + '/thumb?path=' + encodeURIComponent(img.dataset.path) +
+        '&origin=' + encodeURIComponent(location.origin))
+    .then(function (r) {
+      if (r.ok) img.src = img.src.split('?')[0] + '?_=' + Date.now();
+      else img.outerHTML = '📄 ';
+    })
+    .catch(function () { img.outerHTML = '📄 '; });
+}
+
 // ------------------------------------------------------------- preview ----
 
 function showPreview(inner) {
@@ -420,6 +441,57 @@ async function previewFile(path, name) {
     .catch(function (e) { setStatus('превью не удалось: ' + (e.message || e), 'err'); });
 }
 let pvToken = 0;
+
+// ----------------------------------------------------- folder controls ----
+
+drivesEl.addEventListener('click', function (ev) {
+  const b = ev.target.closest('button[data-drive]');
+  if (b) load(b.dataset.drive);
+});
+
+let filterTimer = null;
+filterEl.addEventListener('input', function () {
+  clearTimeout(filterTimer);
+  filterTimer = setTimeout(function () { shown = 0; paint(false); }, 150);
+});
+
+moreEl.onclick = function () { paint(true); };
+document.getElementById('up').onclick = function () { if (parent) load(parent); };
+document.getElementById('refresh').onclick = function () { load(current); };
+document.getElementById('go').onclick = function () { load(pathEl.value); };
+pathEl.addEventListener('keydown', function (e) { if (e.key === 'Enter') load(pathEl.value); });
+
+document.getElementById('mkdir').onclick = async function () {
+  const n = prompt('Имя новой папки:');
+  if (!n) return;
+  try {
+    await op({ action: 'mkdir', path: joinPath(current, n) });
+    load(current);
+  } catch (e) { setStatus(String(e.message || e), 'err'); }
+};
+
+document.getElementById('upload').onclick = function () { document.getElementById('file').click(); };
+
+async function uploadFile(f) {
+  if (f.size > BIG_WARN) setStatus('файл ' + fmtSize(f.size) + ' — заливаю через base64, это небыстро…', 'busy');
+  const b64 = await new Promise(function (res) {
+    const fr = new FileReader();
+    fr.onload = function () { res(String(fr.result).split(',')[1]); };
+    fr.readAsDataURL(f);
+  });
+  try {
+    setStatus('заливаю ' + f.name + '…', 'busy');
+    await op({ action: 'upload', path: current, name: f.name, data: b64 });
+    setStatus('загружено: ' + f.name);
+  } catch (e) { setStatus('ошибка загрузки: ' + (e.message || e), 'err'); }
+}
+
+document.getElementById('file').onchange = async function (ev) {
+  const files = Array.prototype.slice.call(ev.target.files);
+  ev.target.value = '';
+  for (let i = 0; i < files.length; i++) await uploadFile(files[i]);
+  load(current);
+};
 
 // ---------------------------------------------------------- drag & drop ----
 
