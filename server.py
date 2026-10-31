@@ -133,7 +133,7 @@ class ShellSession:
         self.reader_ok = False
         self.output_ready.set()
 
-    def execute(self, cmd, client_gone=None):
+    def execute(self, cmd, client_gone=None, cwd=''):
         """Yield output lines as they arrive from the persistent shell.
 
         One command at a time; client_gone (optional) aborts when the HTTP
@@ -144,28 +144,31 @@ class ShellSession:
             yield 'shell busy: another command is still running\n'
             return
         if self.proc.poll() is not None or not self.reader_ok:
-            # user typed `exit`, cmd died, or the output reader crashed —
-            # give the session a fresh shell
+            # user typed `exit`, cmd died, was killed by interrupt(), or the
+            # output reader crashed — give the session a fresh shell
             _log('shell dead (rc=%s, reader_ok=%s) — respawning'
                  % (self.proc.poll(), self.reader_ok))
             Handler.shell = ShellSession()
             self.exec_lock.release()
-            for chunk in Handler.shell.execute(cmd, client_gone):
+            for chunk in Handler.shell.execute(cmd, client_gone, cwd):
                 yield chunk
             return
         try:
-            for chunk in self._execute_inner(cmd, client_gone):
+            for chunk in self._execute_inner(cmd, client_gone, cwd):
                 yield chunk
         finally:
             self.exec_lock.release()
 
-    def _execute_inner(self, cmd, client_gone=None):
+    def _execute_inner(self, cmd, client_gone=None, cwd=''):
         self.output_ready.clear()
         self._last_cmd = cmd.strip()
         sentinel = '__STASH_CMD_END_%d__' % time.time_ns()
         with self.lock:
             self.output_lines = []
             try:
+                # fresh shell (respawn): restore the working directory first
+                if cwd:
+                    self.proc.stdin.write(('cd /d "%s"\n' % cwd).encode('utf-8', 'replace'))
                 # cmd accepts pipe input as UTF-8, BUT non-ASCII arguments are
                 # re-decoded via the OEM CP internally and break (dir/type on
                 # cyrillic paths -> 'file not found'). Route those through a
@@ -238,12 +241,21 @@ class ShellSession:
                 break
 
     def interrupt(self):
-        """Send Ctrl+C to kill a running foreground command."""
+        """Abort the running foreground command.
+
+        Writing \\x03 to the pipe does NOT interrupt a child (0x03 is just a
+        byte there — the command kept running and wedged the whole session).
+        Kill the cmd process tree instead; the session respawns on next use.
+        """
         try:
-            self.proc.stdin.write(b'\x03')
-            self.proc.stdin.flush()
-        except Exception:
-            pass
+            if IS_WIN:
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(self.proc.pid)],
+                               capture_output=True, timeout=10)
+            else:
+                import signal
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+        except Exception as ex:
+            _log('interrupt: kill failed %r' % ex)
 
 
 # ------------------------------------------------- media: PNG / capture ----
@@ -580,10 +592,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(length)
         cmd = ''
+        cwd = ''
         try:
             data = json.loads(body)
             if isinstance(data, dict):
                 cmd = str(data.get('cmd', ''))
+                cwd = str(data.get('cwd', ''))
         except Exception:
             pass
         if not cmd and body:
@@ -591,7 +605,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Lets a plain `curl ... -d "start notepad"` drive the shell.
             cmd = body.decode('utf-8', 'replace')
 
-        self._stream_exec(cmd)
+        self._stream_exec(cmd, cwd)
 
     def _client_gone(self):
         """True when the HTTP peer has closed the connection."""
@@ -603,7 +617,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return True
         return False
 
-    def _stream_exec(self, cmd):
+    def _stream_exec(self, cmd, cwd=''):
         low = cmd.strip().lower()
         if low in ('screenshot', 'скриншот', 'скрин', 'shot'):
             self._plain(200, screenshot_reply())
@@ -619,7 +633,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
         try:
-            for chunk in Handler.shell.execute(cmd, self._client_gone):
+            for chunk in Handler.shell.execute(cmd, self._client_gone, cwd):
                 try:
                     self.wfile.write(chunk.encode('utf-8', 'replace'))
                     self.wfile.flush()
