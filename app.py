@@ -31,10 +31,14 @@ ARGS = {}
 def read_input():
     global INPUT, ARGS
     raw = b''
-    try:
-        raw = sys.stdin.buffer.read()
-    except Exception:
-        pass
+    env_in = os.environ.get('STASH_INPUT')
+    if env_in:
+        raw = env_in.encode('utf-8', 'replace')
+    if not raw:
+        try:
+            raw = sys.stdin.buffer.read()
+        except Exception:
+            pass
     if raw.strip():
         for enc in ('utf-8-sig', 'utf-8', 'cp1251', 'latin-1'):
             try:
@@ -268,6 +272,39 @@ def act_reset():
     return {'ok': True, 'cwd': os.getcwd()}
 
 
+PID_FILE = os.path.join(PLUGIN_DIR, '.cmd_pid')
+
+
+def _kill_tree(pid):
+    """Kill a process and its children (the command may have spawned more)."""
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)],
+                           capture_output=True, timeout=10)
+        else:
+            import signal
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except Exception:
+        try:
+            os.kill(pid, 9)
+        except Exception:
+            pass
+
+
+def act_interrupt():
+    """Stop the command currently running via exec (kills its process tree)."""
+    try:
+        pid = int(open(PID_FILE).read().strip())
+    except Exception:
+        return {'ok': False, 'err': 'nothing is running'}
+    _kill_tree(pid)
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
+    return {'ok': True}
+
+
 def act_exec():
     cmd = str(ARGS.get('cmd') or '')
     try:
@@ -299,15 +336,26 @@ def act_exec():
         shell_cmd = 'chcp 65001 >nul 2>&1 & cd /d "%s" && %s' % (cwd.replace('"', ''), cmd)
     else:
         shell_cmd = 'cd "%s" && %s' % (cwd.replace('"', ''), cmd)
+    popen_kw = {'start_new_session': True} if not IS_WIN else {}
     proc = subprocess.Popen(shell_cmd, shell=True, cwd=cwd,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, **popen_kw)
+    try:
+        with open(PID_FILE, 'w') as f:
+            f.write(str(proc.pid))
+    except OSError:
+        pass
     timed_out = False
     try:
         o, e = proc.communicate(timeout=timeout if timeout > 0 else None)
     except subprocess.TimeoutExpired:
         timed_out = True
-        proc.kill()
+        _kill_tree(proc.pid)
         o, e = proc.communicate()
+    finally:
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
 
     res = {'out': smart_decode(o), 'err': smart_decode(e),
            'code': proc.returncode, 'cwd': cwd}
@@ -472,7 +520,7 @@ def act_download():
 
 HANDLERS = {
     'hello': act_hello, 'reset': act_reset, 'exec': act_exec,
-    'list': act_list, 'dirsize': act_dirsize, 'mkdir': act_mkdir, 'delete': act_delete,
+    'list': act_list, 'dirsize': act_dirsize, 'interrupt': act_interrupt, 'mkdir': act_mkdir, 'delete': act_delete,
     'rename': act_rename, 'upload': act_upload,
 }
 
