@@ -82,7 +82,10 @@ req = urllib.request.Request('http://127.0.0.1:$PORT/execute', data=json.dumps(d
 with urllib.request.urlopen(req, timeout=600) as r:
     print(r.read().decode())
 " "$SERVER_BODY" 2>/dev/null)
-        if [ -n "$RESP" ]; then
+        RC=$?
+        # empty RESP with RC=0 is VALID: silent commands (bare `cd` on Linux)
+        # produce no output at all -- that is success, not a dead server
+        if [ -n "$RESP" ] || [ "$RC" = 0 ]; then
             $PYEXE -c "
 import sys, json, os
 print(json.dumps({'output': {'out': sys.argv[1], 'err': '', 'code': 0, 'cwd': os.getcwd()}}, separators=(',',':')))
