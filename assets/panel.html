@@ -71,9 +71,16 @@ async function loadStatus() {
   } catch (e) { statEl.textContent = 'статус недоступен: ' + (e.message || e); }
 }
 
-function refreshShot() {
+async function refreshShot() {
   if (!SRV || document.hidden) return;  // don't burn CPU on a background tab
-  shotEl.src = SRV + '/shot.png?_t=' + Date.now();
+  try {
+    // /shot saves the PNG into assets/_cache and returns its direct URL;
+    // we use the SAME-ORIGIN Stash path for it (no CSP problems)
+    const r = await fetch(SRV + '/shot', { cache: 'no-store' });
+    const txt = await r.text();
+    const m = txt.match(/shot-[0-9-]+\.png/);
+    if (m) shotEl.src = '/plugin/' + PLUGIN + '/assets/_cache/' + m[0] + '?_t=' + Date.now();
+  } catch (e) { /* keep last shot */ }
 }
 
 shotEl.onerror = function () {
