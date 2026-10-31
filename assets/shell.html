@@ -154,7 +154,7 @@ async function runCommand(line) {
     setStatus('готово');
   } catch (e) {
     if (e.name === 'AbortError') {
-      write('<span class="meta">ожидание отменено (команда остановлена ниже)</span>');
+      write('<span class="meta">ожидание прекращено (команда остановлена на сервере)</span>');
       setStatus('готово');
     } else {
       write(esc(String(e.message || e)), 'err');
@@ -169,7 +169,7 @@ async function runCommand(line) {
 }
 
 function interrupt() {
-  // runs alongside the blocked exec request: plugin kills the command
+  // ask app.py to kill the running command's process tree
   write('<span class="err">^C</span>');
   stashOp({ action: 'interrupt' }).catch(function () { });
 }
