@@ -169,7 +169,7 @@ async function runCommand(line) {
     const res = await fetch('http://127.0.0.1:' + serverPort + '/execute', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cmd: line }),
+      body: JSON.stringify({ cmd: line, cwd: cwd }),
       signal: controller.signal,
     });
     if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
