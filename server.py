@@ -187,7 +187,6 @@ class ShellSession:
             except Exception as ex:
                 _log('execute: stdin write failed %r (rc=%s)' % (ex, self.proc.poll()))
 
-        yielded_ids = set()
         idle = 0.0
         while True:
             self.output_ready.wait(timeout=0.1)
@@ -197,13 +196,14 @@ class ShellSession:
                 batch = list(self.output_lines)
                 self.output_lines = []
 
-            new_lines = [l for l in batch if id(l) not in yielded_ids]
-            if not new_lines:
+            # NOTE: do NOT filter lines by id() — CPython reuses string object
+            # ids after GC, which silently dropped random output lines.
+            # The swap above guarantees every batch line is new.
+            if not batch:
                 idle += 0.1
             else:
                 idle = 0.0
-            for l in new_lines:
-                yielded_ids.add(id(l))
+            for l in batch:
                 if sentinel in l:
                     return
                 # Filter out command echo (cmd.exe may echo even with @echo off)
@@ -226,10 +226,9 @@ class ShellSession:
                     remaining = list(self.output_lines)
                     self.output_lines = []
                 for l in remaining:
-                    if id(l) not in yielded_ids:
-                        stripped = l.strip()
-                        if stripped and stripped != self._last_cmd and not stripped.startswith(self._last_cmd):
-                            yield l
+                    stripped = l.strip()
+                    if stripped and stripped != self._last_cmd and not stripped.startswith(self._last_cmd):
+                        yield l
                 break
 
     def interrupt(self):
