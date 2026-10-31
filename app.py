@@ -346,8 +346,6 @@ def act_list():
                     is_dir = entry.is_dir()
                     st = entry.stat(follow_symlinks=False)
                     size, mtime = st.st_size, int(st.st_mtime)
-                    if is_dir:
-                        size = folder_size(entry.path)
                 except OSError:
                     is_dir, size, mtime = False, 0, 0
                 items.append({'name': entry.name, 'dir': is_dir,
