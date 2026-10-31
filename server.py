@@ -142,8 +142,18 @@ class ShellSession:
         session for everyone else.
         """
         if not self.exec_lock.acquire(blocking=False):
-            yield 'shell busy: another command is still running\n'
-            return
+            # Safety net: a lock held way too long means some edge case leaked
+            # it (should not happen, but 'busy forever' is worse than a rare
+            # forced unlock) — force-release and take over.
+            held = time.time() - getattr(self, '_lock_since', 0)
+            if held > 120:
+                _log('execute: lock held %.0fs — force release' % held)
+                self.exec_lock.release()
+                self.exec_lock.acquire()
+            else:
+                yield 'shell busy: another command is still running\n'
+                return
+        self._lock_since = time.time()
         if self.proc.poll() is not None or not self.reader_ok:
             # user typed `exit`, cmd died, was killed by interrupt(), or the
             # output reader crashed — give the session a fresh shell
@@ -151,6 +161,7 @@ class ShellSession:
                  % (self.proc.poll(), self.reader_ok))
             Handler.shell = ShellSession()
             self.exec_lock.release()
+            _log('execute: respawn delegated, old lock released')
             for chunk in Handler.shell.execute(cmd, client_gone, cwd):
                 yield chunk
             return
@@ -159,6 +170,7 @@ class ShellSession:
                 yield chunk
         finally:
             self.exec_lock.release()
+            _log('execute: lock released')
 
     def _execute_inner(self, cmd, client_gone=None, cwd=''):
         self.output_ready.clear()
