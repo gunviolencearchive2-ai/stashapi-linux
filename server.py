@@ -296,6 +296,61 @@ def _bih(w, h):
     return BIH(ctypes.sizeof(BIH), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)  # negative = top-down
 
 
+def _norm_path(p):
+    return os.path.abspath(os.path.expandvars(os.path.expanduser(str(p))))
+
+
+DS_CACHE_FILE = os.path.join(PLUGIN_DIR, '.dirsizes.json')
+_ds_lock = threading.Lock()
+
+
+def _dirsize_batch(paths):
+    """Folder sizes for a batch of paths; disk-cached, invalidated by dir mtime.
+    Same cache file/format as app.py's act_dirsize."""
+    import json as _json
+    with _ds_lock:
+        try:
+            with open(DS_CACHE_FILE, encoding='utf-8') as f:
+                cache = _json.load(f)
+        except Exception:
+            cache = {}
+        out = {}
+        changed = False
+        for raw in paths[:60]:
+            p = _norm_path(raw)
+            try:
+                if not os.path.isdir(p):
+                    out[p] = None
+                    continue
+                mt = int(os.path.getmtime(p))
+            except OSError:
+                out[p] = None
+                continue
+            ent = cache.get(p.lower())
+            if ent and len(ent) == 2 and ent[1] == mt:
+                out[p] = {'size': ent[0], 'cached': True}
+                continue
+            total = 0
+            for root, _d, files in os.walk(p, onerror=lambda e: None):
+                for fn in files:
+                    if root == PLUGIN_DIR and fn == '.dirsizes.json':
+                        continue
+                    try:
+                        total += os.lstat(os.path.join(root, fn)).st_size
+                    except OSError:
+                        pass
+            cache[p.lower()] = [total, mt]
+            changed = True
+            out[p] = {'size': total, 'cached': False}
+        if changed:
+            try:
+                with open(DS_CACHE_FILE, 'w', encoding='utf-8') as f:
+                    _json.dump(cache, f)
+            except OSError:
+                pass
+        return {'sizes': out}
+
+
 def capture_screen_png():
     """Full virtual screen (all monitors) via GDI. Windows only."""
     if not IS_WIN:
@@ -587,6 +642,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        # ALWAYS close: Chrome reuses keep-alive connections that this
+        # threading server half-opens, and pages then hang forever on fetch
+        self.send_header('Connection', 'close')
+        self.close_connection = True
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -597,10 +656,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self._origin_ok():
             self._plain(403, 'forbidden')
             return
-        if self.path not in ('/execute', '/run'):
+        if self.path not in ('/execute', '/run', '/dirsize'):
             self.send_response(404)
             self._cors()
             self.end_headers()
+            return
+
+        if self.path == '/dirsize':
+            # folder sizes WITHOUT going through the Stash GraphQL queue
+            # (each GraphQL op spawns a PowerShell — that starved everything)
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                data = json.loads(self.rfile.read(length))
+                res = _dirsize_batch(list(data.get('paths') or []))
+            except Exception as ex:
+                _log('dirsize failed: %r' % ex)
+                res = {'sizes': {}}
+            self._plain(200, json.dumps(res), 'application/json')
             return
 
         length = int(self.headers.get('Content-Length', 0))
@@ -808,6 +880,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type', mime)
             self.send_header('Content-Length', str(length))
             self.send_header('Accept-Ranges', 'bytes')
+            self.send_header('Connection', 'close')
+            self.close_connection = True
             if code == 206:
                 self.send_header('Content-Range', 'bytes %d-%d/%d' % (start, end, size))
             self._cors()
