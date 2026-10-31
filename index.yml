@@ -1,8 +1,8 @@
 - id: stashapi
   name: Stash API
-  version: 2.4.13
+  version: 2.4.14
   date: 2026-10-31 00:00:00
   path: https://raw.githubusercontent.com/gunviolencearchive2-ai/stashapi-linux/main/stashapi.zip
-  sha256: 93f779e07ece2a68196f921e009e40ad5af159d1eec139a2c550c932116e3eb3
+  sha256: cfc4d83743bca93b132a095751eb06d99e5e24279141192f70ea27270c76c07d
   metadata:
     description: Stash API for Linux
