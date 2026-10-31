@@ -88,6 +88,16 @@ class ShellSession:
                 preexec_fn=os.setsid,
             )
         self.cwd = os.getcwd()
+        if not IS_WIN:
+            # leave the ugly inherited service dir (/run/s6-rc:...): start the
+            # shell in the user's home, or / when it is unusable
+            home = os.path.expanduser('~')
+            try:
+                self.proc.stdin.write(('cd "%s" 2>/dev/null || cd /\n' % home).encode())
+                self.proc.stdin.flush()
+                self.cwd = home if os.path.isdir(home) else '/'
+            except Exception:
+                pass
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
 
