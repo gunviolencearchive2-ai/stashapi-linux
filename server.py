@@ -19,6 +19,7 @@ import zlib
 import string
 import mimetypes
 import shutil
+import tempfile
 
 IS_WIN = os.name == 'nt'
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -58,26 +59,27 @@ class ShellSession:
     def __init__(self):
         self.lock = threading.Lock()
         self.exec_lock = threading.Lock()
+        self.reader_ok = True
         self.output_lines = []
         self.output_ready = threading.Event()
         self._last_cmd = None
 
         if IS_WIN:
+            # Binary pipes: cmd.exe emits OEM (cp866) for some strings and
+            # UTF-8 for others — text=True would crash the reader thread on
+            # the first non-UTF-8 byte (it killed the whole session on `dir`
+            # of any drive with a Russian volume label).
             self.proc = subprocess.Popen(
                 ['cmd.exe', '/Q', '/K'],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
             # Suppress command echo and simplify prompt, then wait until the
             # shell has consumed the init commands (sentinel) so user commands
             # are never echoed with the prompt prefix.
-            self.proc.stdin.write('@echo off\n')
-            self.proc.stdin.write('prompt $P$G\n')
-            self.proc.stdin.write('echo __STASH_INIT_END__\n')
+            self.proc.stdin.write(b'@echo off\r\nprompt $P$G\r\nchcp 866>nul\r\necho __STASH_INIT_END__\r\n')
             self.proc.stdin.flush()
             deadline = time.time() + 5
             try:
@@ -85,7 +87,7 @@ class ShellSession:
                     line = self.proc.stdout.readline()
                     if not line:
                         break
-                    if '__STASH_INIT_END__' in line:
+                    if b'__STASH_INIT_END__' in line:
                         break
             except Exception:
                 pass
@@ -97,13 +99,22 @@ class ShellSession:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
                 preexec_fn=os.setsid,
             )
         self.cwd = os.getcwd()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
+
+    @staticmethod
+    def _smart(b):
+        """Decode shell output bytes: cmd emits cp866/UTF-8 depending on the
+        program, never let decoding kill the reader."""
+        for enc in ('utf-8', 'cp866', 'cp1251'):
+            try:
+                return b.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return b.decode('utf-8', 'replace')
 
     def _read_loop(self):
         """Continuously drain shell stdout so the shell never blocks."""
@@ -114,11 +125,13 @@ class ShellSession:
                     _log('reader: EOF (shell exited, rc=%s)' % self.proc.poll())
                     break
                 with self.lock:
-                    self.output_lines.append(line)
+                    self.output_lines.append(self._smart(line))
                 self.output_ready.set()
             except Exception as ex:
                 _log('reader: exception %r' % ex)
                 break
+        self.reader_ok = False
+        self.output_ready.set()
 
     def execute(self, cmd, client_gone=None):
         """Yield output lines as they arrive from the persistent shell.
@@ -130,9 +143,11 @@ class ShellSession:
         if not self.exec_lock.acquire(blocking=False):
             yield 'shell busy: another command is still running\n'
             return
-        if self.proc.poll() is not None:
-            # user typed `exit` or cmd died — give the session a fresh shell
-            _log('shell dead (rc=%s) — respawning' % self.proc.poll())
+        if self.proc.poll() is not None or not self.reader_ok:
+            # user typed `exit`, cmd died, or the output reader crashed —
+            # give the session a fresh shell
+            _log('shell dead (rc=%s, reader_ok=%s) — respawning'
+                 % (self.proc.poll(), self.reader_ok))
             Handler.shell = ShellSession()
             self.exec_lock.release()
             for chunk in Handler.shell.execute(cmd, client_gone):
@@ -151,8 +166,28 @@ class ShellSession:
         with self.lock:
             self.output_lines = []
             try:
-                self.proc.stdin.write(cmd + '\n')
-                self.proc.stdin.write('echo %s\n' % sentinel)
+                # cmd accepts pipe input as UTF-8, BUT non-ASCII arguments are
+                # re-decoded via the OEM CP internally and break (dir/type on
+                # cyrillic paths -> 'file not found'). Route those through a
+                # temp .bat written in the OEM codepage instead; batch files
+                # are parsed as cp866 on RU Windows.
+                if IS_WIN and not cmd.isascii():
+                    try:
+                        bat = os.path.join(tempfile.gettempdir(), 'stash_cmd.bat')
+                        with open(bat, 'w', encoding='cp866', errors='replace',
+                                  newline='') as f:
+                            f.write('@echo off\r\n' + cmd.rstrip() + '\r\n')
+                        line = 'call "%s"' % bat
+                    except Exception:
+                        line = cmd
+                else:
+                    line = cmd
+                self.proc.stdin.write((line + '\n').encode('utf-8', 'replace'))
+                # 'echo.' forces a line break: commands whose output lacks a
+                # trailing newline (e.g. `type` of a file) would otherwise
+                # swallow the sentinel into the same line
+                self.proc.stdin.write(b'echo.\r\n')
+                self.proc.stdin.write(('echo %s\n' % sentinel).encode())
                 self.proc.stdin.flush()
             except Exception as ex:
                 _log('execute: stdin write failed %r (rc=%s)' % (ex, self.proc.poll()))
@@ -205,7 +240,7 @@ class ShellSession:
     def interrupt(self):
         """Send Ctrl+C to kill a running foreground command."""
         try:
-            self.proc.stdin.write('\x03')
+            self.proc.stdin.write(b'\x03')
             self.proc.stdin.flush()
         except Exception:
             pass
