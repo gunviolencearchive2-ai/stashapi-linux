@@ -344,6 +344,56 @@ def act_list():
             'items': items, 'drives': drives()}
 
 
+DS_CACHE_FILE = os.path.join(PLUGIN_DIR, '.dirsizes.json')
+
+
+def act_dirsize():
+    """Fallback for when the terminal server is unreachable."""
+    paths = ARGS.get('paths') or []
+    if isinstance(paths, str):
+        paths = [paths]
+    try:
+        with open(DS_CACHE_FILE, encoding='utf-8') as f:
+            cache = json.load(f)
+    except Exception:
+        cache = {}
+    out = {}
+    changed = False
+    for raw in paths[:60]:
+        p = norm(raw)
+        try:
+            if not os.path.isdir(p):
+                out[p] = None
+                continue
+            mt = int(os.path.getmtime(p))
+        except OSError:
+            out[p] = None
+            continue
+        ent = cache.get(p.lower())
+        if ent and len(ent) == 2 and ent[1] == mt:
+            out[p] = {'size': ent[0], 'cached': True}
+            continue
+        total = 0
+        for root, _d, files in os.walk(p, onerror=lambda e: None):
+            for fn in files:
+                if root == PLUGIN_DIR and fn == '.dirsizes.json':
+                    continue
+                try:
+                    total += os.lstat(os.path.join(root, fn)).st_size
+                except OSError:
+                    pass
+        cache[p.lower()] = [total, mt]
+        changed = True
+        out[p] = {'size': total, 'cached': False}
+    if changed:
+        try:
+            with open(DS_CACHE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(cache, f)
+        except OSError:
+            pass
+    return {'sizes': out}
+
+
 def act_mkdir():
     path = norm(ARGS.get('path'))
     os.makedirs(path, exist_ok=True)
@@ -418,7 +468,7 @@ def act_download():
 
 HANDLERS = {
     'hello': act_hello, 'reset': act_reset, 'exec': act_exec,
-    'list': act_list, 'mkdir': act_mkdir, 'delete': act_delete,
+    'list': act_list, 'dirsize': act_dirsize, 'mkdir': act_mkdir, 'delete': act_delete,
     'rename': act_rename, 'upload': act_upload,
 }
 
