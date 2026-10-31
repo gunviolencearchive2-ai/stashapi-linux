@@ -348,8 +348,16 @@ def act_list():
                     size, mtime = st.st_size, int(st.st_mtime)
                 except OSError:
                     is_dir, size, mtime = False, 0, 0
-                items.append({'name': entry.name, 'dir': is_dir,
-                              'size': size, 'mtime': mtime})
+                it_ = {'name': entry.name, 'dir': is_dir,
+                       'size': size, 'mtime': mtime}
+                if not is_dir:
+                    # thumbnail cache key (same formula as server.py) so the
+                    # UI can use the same-origin /plugin/.../_cache/thumbs URL
+                    import hashlib
+                    it_['tk'] = hashlib.md5(
+                        ('%s|%d|%d' % (entry.path.lower(), st.st_mtime, 256))
+                        .encode('utf-8', 'replace')).hexdigest()
+                items.append(it_)
     except OSError as ex:
         return {'error': str(ex), 'path': path, 'items': [], 'drives': drives()}
     items.sort(key=lambda x: (not x['dir'], x['name'].lower()))
