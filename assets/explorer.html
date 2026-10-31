@@ -183,7 +183,7 @@ function rowHtml(it) {
     const ext = extOf(it.name);
     if (SRV && (IMG_EXT.indexOf(ext) !== -1 || VID_EXT.indexOf(ext) !== -1)) {
       const tp = joinPath(current, it.name);
-      icon = '<img class="thumb" loading="lazy" alt="" src="' + attr(SRV + '/thumb?path=' + encodeURIComponent(tp)) +
+      icon = '<img class="thumb" loading="lazy" alt="" src="' + attr(SRV + '/thumb?path=' + encodeURIComponent(tp) + '&origin=' + encodeURIComponent(location.origin)) +
              '" onerror="this.outerHTML=\'📄 \'">';
     } else {
       icon = '📄 ';
@@ -392,75 +392,34 @@ function closePreview() {
   if (ov) { ov.classList.remove('on'); document.getElementById('ovb').innerHTML = ''; }
 }
 
-function previewFile(path, name) {
+async function previewFile(path, name) {
   const ext = extOf(name);
-  if (!SRV) { download(path, name, false, false); return; }  // no terminal server — fall back to download
-  const url = SRV + '/file?path=' + encodeURIComponent(path);
+  if (IMG_EXT.concat(VID_EXT, AUD_EXT, TXT_EXT).indexOf(ext) === -1) { download(path, name, false, false); return; }
+  setStatus('готовлю превью ' + name + '…');
+  let url = null, blob = null;
+  try {
+    // same-origin URL via the download action (hardlink in _cache);
+    // falls back to a base64 blob when a hardlink is impossible
+    const res = await op({ action: 'download', path: path });
+    if (res && res.url) url = res.url;
+    else if (res && res.data) { blob = await b64ToBlob(res.data, res.mime || 'application/octet-stream'); url = URL.createObjectURL(blob); }
+    else throw new Error('нет ответа');
+  } catch (e) { setStatus('превью не удалось: ' + (e.message || e), 'err'); return; }
+  ++pvToken;  // superseded marker (a newer preview replaces this one)
+  setStatus('');
   if (IMG_EXT.indexOf(ext) !== -1) { showPreview('<img src="' + attr(url) + '" alt="' + attr(name) + '">'); return; }
   if (VID_EXT.indexOf(ext) !== -1) { showPreview('<video controls autoplay src="' + attr(url) + '"></video>'); return; }
   if (AUD_EXT.indexOf(ext) !== -1) { showPreview('<p style="color:#dcdfe6">' + esc(name) + '</p><audio controls autoplay src="' + attr(url) + '"></audio>'); return; }
-  if (TXT_EXT.indexOf(ext) !== -1) {
-    setStatus('читаю ' + name + '…');
-    fetch(url).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
-      .then(function (t) {
-        const cut = t.length > 300000;
-        showPreview('<pre>' + esc(cut ? t.slice(0, 300000) : t) + (cut ? '\n… (обрезано)' : '') + '</pre>');
-        setStatus('');
-      })
-      .catch(function (e) { setStatus('превью не удалось: ' + (e.message || e), 'err'); });
-    return;
-  }
-  download(path, name, false, false);
+  setStatus('читаю ' + name + '…');
+  fetch(url).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+    .then(function (t) {
+      const cut = t.length > 300000;
+      showPreview('<pre>' + esc(cut ? t.slice(0, 300000) : t) + (cut ? '\n… (обрезано)' : '') + '</pre>');
+      setStatus('');
+    })
+    .catch(function (e) { setStatus('превью не удалось: ' + (e.message || e), 'err'); });
 }
-
-drivesEl.addEventListener('click', function (ev) {
-  const b = ev.target.closest('button[data-drive]');
-  if (b) load(b.dataset.drive);
-});
-
-let filterTimer = null;
-filterEl.addEventListener('input', function () {
-  clearTimeout(filterTimer);
-  filterTimer = setTimeout(function () { shown = 0; paint(false); }, 150);
-});
-
-moreEl.onclick = function () { paint(true); };
-document.getElementById('up').onclick = function () { if (parent) load(parent); };
-document.getElementById('refresh').onclick = function () { load(current); };
-document.getElementById('go').onclick = function () { load(pathEl.value); };
-pathEl.addEventListener('keydown', function (e) { if (e.key === 'Enter') load(pathEl.value); });
-
-document.getElementById('mkdir').onclick = async function () {
-  const n = prompt('Имя новой папки:');
-  if (!n) return;
-  try {
-    await op({ action: 'mkdir', path: joinPath(current, n) });
-    load(current);
-  } catch (e) { setStatus(String(e.message || e), 'err'); }
-};
-
-document.getElementById('upload').onclick = function () { document.getElementById('file').click(); };
-
-async function uploadFile(f) {
-  if (f.size > BIG_WARN) setStatus('файл ' + fmtSize(f.size) + ' — заливаю через base64, это небыстро…', 'busy');
-  const b64 = await new Promise(function (res) {
-    const fr = new FileReader();
-    fr.onload = function () { res(String(fr.result).split(',')[1]); };
-    fr.readAsDataURL(f);
-  });
-  try {
-    setStatus('заливаю ' + f.name + '…', 'busy');
-    await op({ action: 'upload', path: current, name: f.name, data: b64 });
-    setStatus('загружено: ' + f.name);
-  } catch (e) { setStatus('ошибка загрузки: ' + (e.message || e), 'err'); }
-}
-
-document.getElementById('file').onchange = async function (ev) {
-  const files = Array.prototype.slice.call(ev.target.files);
-  ev.target.value = '';
-  for (let i = 0; i < files.length; i++) await uploadFile(files[i]);
-  load(current);
-};
+let pvToken = 0;
 
 // ---------------------------------------------------------- drag & drop ----
 
