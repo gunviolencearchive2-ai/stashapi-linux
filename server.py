@@ -75,8 +75,13 @@ class ShellSession:
             with self.lock:
                 self.output_lines = []
         else:
+            # minimal systems (Alpine, slim docker images) have no bash —
+            # fall back to /bin/sh (FileNotFoundError killed the whole server)
+            import shutil
+            shell_bin = shutil.which('bash') or '/bin/sh'
+            args = [shell_bin] + (['--noprofile', '--norc'] if shell_bin.endswith('bash') else [])
             self.proc = subprocess.Popen(
-                ['bash', '--noprofile', '--norc'],
+                args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -159,7 +164,8 @@ class ShellSession:
             try:
                 # fresh shell (respawn): restore the working directory first
                 if cwd:
-                    self.proc.stdin.write(('cd /d "%s"\n' % cwd).encode('utf-8', 'replace'))
+                    cd = 'cd /d "%s"' % cwd if IS_WIN else 'cd "%s"' % cwd
+                    self.proc.stdin.write((cd + '\n').encode('utf-8', 'replace'))
                 # cmd accepts pipe input as UTF-8, BUT non-ASCII arguments are
                 # re-decoded via the OEM CP internally and break (dir/type on
                 # cyrillic paths -> 'file not found'). Route those through a
@@ -181,7 +187,7 @@ class ShellSession:
                 # 'echo.' forces a line break: commands whose output lacks a
                 # trailing newline (e.g. `type` of a file) would otherwise
                 # swallow the sentinel into the same line
-                self.proc.stdin.write(b'echo.\r\n')
+                self.proc.stdin.write(b'echo.\r\n' if IS_WIN else b'echo\n')
                 self.proc.stdin.write(('echo %s\n' % sentinel).encode())
                 self.proc.stdin.flush()
             except Exception as ex:
@@ -308,7 +314,7 @@ def bind_server():
     """
     for p in [BASE_PORT] + list(range(BASE_PORT + 1, BASE_PORT + 50)):
         try:
-            return socketserver.ThreadingTCPServer(('127.0.0.1', p), Handler)
+            return socketserver.ThreadingTCPServer(('0.0.0.0', p), Handler)
         except OSError:
             continue
     return None
@@ -330,10 +336,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Connection', 'close')
         self.close_connection = True
 
+    def _private_peer(self):
+        """True when the TCP peer is loopback or a private-network address.
+        A public-internet peer must never reach the shell, with or without
+        an Origin header (curl from the internet sends no Origin)."""
+        try:
+            ip = self.connection.getpeername()[0]
+        except Exception:
+            return False
+        if ip.startswith('127.') or ip == '::1':
+            return True
+        if ip.startswith('192.168.') or ip.startswith('10.'):
+            return True
+        if ip.startswith('172.'):
+            try:
+                if 16 <= int(ip.split('.')[1]) <= 31:
+                    return True
+            except (ValueError, IndexError):
+                pass
+        return False
+
     def _origin_ok(self):
         """Only pages on this machine or its private networks may read us
         cross-origin (a public site must not be able to drive the shell);
         curl and same-origin requests send no Origin header."""
+        if not self._private_peer():
+            return False
         o = self.headers.get('Origin')
         if not o:
             return True
