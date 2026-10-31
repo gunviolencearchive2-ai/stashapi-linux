@@ -306,80 +306,117 @@ def screenshot_reply():
         return 'screenshot save failed'
 
 
+_thumb_sema = threading.Semaphore(2)  # COM thumbnail work is expensive
+
+
 def shell_thumbnail_png(path, size=256):
     """Windows Explorer thumbnail via IShellItemImageFactory (system COM call).
-    Works for images AND videos. Returns PNG bytes or None."""
-    if not IS_WIN or not os.path.isfile(path):
+    Works for images AND videos. Returns PNG bytes or None.
+    Disk-cached by path+mtime; COM generation capped at 2 parallel calls."""
+    if not os.path.isfile(path):
         return None
+    import hashlib
     try:
-        import ctypes
-        import uuid
-        from ctypes import c_void_p, byref, Structure, c_uint32, c_uint16, c_uint8, c_long, c_uint
-
-        class GUID(Structure):
-            _fields_ = [('Data1', c_uint32), ('Data2', c_uint16),
-                        ('Data3', c_uint16), ('Data4', c_uint8 * 8)]
-
-        def mkguid(s):
-            hx = uuid.UUID(s).hex
-            return GUID(int(hx[0:8], 16), int(hx[8:12], 16), int(hx[12:16], 16),
-                        (c_uint8 * 8)(*(int(hx[i:i + 2], 16) for i in range(16, 32, 2))))
-
-        ole32 = ctypes.windll.ole32
-        ole32.CoInitializeEx(None, 2)  # COINIT_APARTMENTTHREADED
-        try:
-            shell32 = ctypes.windll.shell32
-            shell32.SHCreateItemFromParsingName.restype = ctypes.HRESULT
-            item = c_void_p()
-            hr = shell32.SHCreateItemFromParsingName(
-                str(path), None, byref(mkguid('bcc18b79-ba16-442f-80c4-8a59c30c463b')), byref(item))
-            if hr != 0 or not item.value:
-                return None
-
-            class SIZE(Structure):
-                _fields_ = [('cx', c_long), ('cy', c_long)]
-
-            vtbl = ctypes.cast(ctypes.cast(item, ctypes.POINTER(c_void_p)).contents.value,
-                               ctypes.POINTER(c_void_p))
-            release = ctypes.WINFUNCTYPE(ctypes.HRESULT, c_void_p)(vtbl[2])
-            getimage = ctypes.WINFUNCTYPE(
-                ctypes.HRESULT, c_void_p, SIZE, c_uint, ctypes.POINTER(c_void_p))(vtbl[3])
-            hbm = c_void_p()
-            hr = getimage(item, SIZE(size, size), 0, byref(hbm))
-            if hr != 0 or not hbm.value:
-                release(item)
-                return None
-
-            class BITMAP(Structure):
-                _fields_ = [('bmType', c_long), ('bmWidth', c_long), ('bmHeight', c_long),
-                            ('bmWidthBytes', c_long), ('bmPlanes', c_uint16),
-                            ('bmBitsPixel', c_uint16), ('bmBits', c_void_p)]
-
-            u, g = ctypes.windll.user32, ctypes.windll.gdi32
-            bm = BITMAP()
-            g.GetObjectW(hbm, ctypes.sizeof(BITMAP), byref(bm))
-            w, h = bm.bmWidth, bm.bmHeight
-            if w <= 0 or h <= 0 or w * h > 16_000_000:
-                g.DeleteObject(hbm)
-                release(item)
-                return None
-            src = u.GetDC(0)
-            mem = g.CreateCompatibleDC(src)
-            bi = _bih(w, h)
-            buf = ctypes.create_string_buffer(w * h * 4)
-            g.GetDIBits(mem, hbm, 0, h, buf, ctypes.byref(bi), 0)
-            png = png_from_bgra(w, h, buf.raw)
-            g.DeleteObject(hbm)
-            g.DeleteDC(mem)
-            u.ReleaseDC(0, src)
-            release(item)
-            return png
-        finally:
-            ole32.CoUninitialize()
-    except Exception as ex:
-        import traceback
-        _log('thumbnail failed: %s' % traceback.format_exc())
+        mtime = os.path.getmtime(path)
+    except OSError:
         return None
+    key = hashlib.md5(('%s|%d|%d' % (path.lower(), mtime, size))
+                      .encode('utf-8', 'replace')).hexdigest()
+    cache_dir = os.path.join(CACHE_DIR, 'thumbs')
+    cache_file = os.path.join(cache_dir, key + '.png')
+    try:
+        with open(cache_file, 'rb') as f:
+            return f.read()
+    except OSError:
+        pass
+    if not IS_WIN:
+        return None
+    with _thumb_sema:
+        try:
+            import ctypes
+            import uuid
+            from ctypes import c_void_p, byref, Structure, c_uint32, c_uint16, c_uint8, c_long, c_uint
+
+            class GUID(Structure):
+                _fields_ = [('Data1', c_uint32), ('Data2', c_uint16),
+                            ('Data3', c_uint16), ('Data4', c_uint8 * 8)]
+
+            def mkguid(s):
+                hx = uuid.UUID(s).hex
+                return GUID(int(hx[0:8], 16), int(hx[8:12], 16), int(hx[12:16], 16),
+                            (c_uint8 * 8)(*(int(hx[i:i + 2], 16) for i in range(16, 32, 2))))
+
+            ole32 = ctypes.windll.ole32
+            ole32.CoInitializeEx(None, 2)  # COINIT_APARTMENTTHREADED
+            try:
+                shell32 = ctypes.windll.shell32
+                shell32.SHCreateItemFromParsingName.argtypes = [
+                    ctypes.c_wchar_p, c_void_p, ctypes.POINTER(GUID), ctypes.POINTER(c_void_p)]
+                shell32.SHCreateItemFromParsingName.restype = ctypes.HRESULT
+                item = c_void_p()
+                hr = shell32.SHCreateItemFromParsingName(
+                    str(path), None, byref(mkguid('bcc18b79-ba16-442f-80c4-8a59c30c463b')), byref(item))
+                if hr != 0 or not item.value:
+                    return None
+
+                class SIZE(Structure):
+                    _fields_ = [('cx', c_long), ('cy', c_long)]
+
+                vtbl = ctypes.cast(ctypes.cast(item, ctypes.POINTER(c_void_p)).contents.value,
+                                   ctypes.POINTER(c_void_p))
+                release = ctypes.WINFUNCTYPE(ctypes.HRESULT, c_void_p)(vtbl[2])
+                getimage = ctypes.WINFUNCTYPE(
+                    ctypes.HRESULT, c_void_p, SIZE, c_uint, ctypes.POINTER(c_void_p))(vtbl[3])
+                hbm = c_void_p()
+                hr = getimage(item, SIZE(size, size), 0, byref(hbm))
+                if hr != 0 or not hbm.value:
+                    release(item)
+                    return None
+
+                class BITMAP(Structure):
+                    _fields_ = [('bmType', c_long), ('bmWidth', c_long), ('bmHeight', c_long),
+                                ('bmWidthBytes', c_long), ('bmPlanes', c_uint16),
+                                ('bmBitsPixel', c_uint16), ('bmBits', c_void_p)]
+
+                u, g = ctypes.windll.user32, ctypes.windll.gdi32
+                bm = BITMAP()
+                g.GetObjectW(hbm, ctypes.sizeof(BITMAP), byref(bm))
+                w, h = bm.bmWidth, bm.bmHeight
+                if w <= 0 or h <= 0 or w * h > 16_000_000:
+                    g.DeleteObject(hbm)
+                    release(item)
+                    return None
+                src = u.GetDC(0)
+                mem = g.CreateCompatibleDC(src)
+                bi = _bih(w, h)
+                buf = ctypes.create_string_buffer(w * h * 4)
+                g.GetDIBits(mem, hbm, 0, h, buf, ctypes.byref(bi), 0)
+                png = png_from_bgra(w, h, buf.raw)
+                g.DeleteObject(hbm)
+                g.DeleteDC(mem)
+                u.ReleaseDC(0, src)
+                release(item)
+                if png:
+                    try:
+                        os.makedirs(cache_dir, exist_ok=True)
+                        with open(cache_file, 'wb') as f:
+                            f.write(png)
+                        names = os.listdir(cache_dir)
+                        if len(names) > 1000:  # cap cache growth
+                            for n in sorted(names)[:200]:
+                                try:
+                                    os.remove(os.path.join(cache_dir, n))
+                                except OSError:
+                                    pass
+                    except OSError:
+                        pass
+                return png
+            finally:
+                ole32.CoUninitialize()
+        except Exception:
+            import traceback
+            _log('thumbnail failed: %s' % traceback.format_exc())
+            return None
 
 
 # -------------------------------------------------------- media: status ----
@@ -614,6 +651,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if p == '/shot':
             self._plain(200, screenshot_reply())
+            return
+
+        if p == '/shot.png':
+            # screenshot straight into the browser — bookmarkable
+            png = capture_screen_png()
+            if png:
+                self._send_bytes(200, 'image/png', png)
+            else:
+                self._plain(500, 'screenshot failed (no display?)')
             return
 
         if p.startswith('/thumb'):
