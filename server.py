@@ -249,6 +249,56 @@ class ShellSession:
             _log('interrupt: kill failed %r' % ex)
 
 
+DS_CACHE_FILE = os.path.join(PLUGIN_DIR, '.dirsizes.json')
+_ds_lock = threading.Lock()
+
+
+def _dirsize_batch(paths):
+    """Folder sizes for a batch of paths; disk-cached, invalidated by dir mtime.
+    Runs on the local server so it never starves the Stash operation queue."""
+    with _ds_lock:
+        try:
+            with open(DS_CACHE_FILE, encoding='utf-8') as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+        out = {}
+        changed = False
+        for raw in paths[:60]:
+            p = os.path.abspath(os.path.expandvars(os.path.expanduser(str(raw))))
+            try:
+                if not os.path.isdir(p):
+                    out[p] = None
+                    continue
+                mt = int(os.path.getmtime(p))
+            except OSError:
+                out[p] = None
+                continue
+            ent = cache.get(p.lower())
+            if ent and len(ent) == 2 and ent[1] == mt:
+                out[p] = {'size': ent[0], 'cached': True}
+                continue
+            total = 0
+            for root, _d, files in os.walk(p, onerror=lambda e: None):
+                for fn in files:
+                    if root == PLUGIN_DIR and fn == '.dirsizes.json':
+                        continue
+                    try:
+                        total += os.lstat(os.path.join(root, fn)).st_size
+                    except OSError:
+                        pass
+            cache[p.lower()] = [total, mt]
+            changed = True
+            out[p] = {'size': total, 'cached': False}
+        if changed:
+            try:
+                with open(DS_CACHE_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(cache, f)
+            except OSError:
+                pass
+        return {'sizes': out}
+
+
 def bind_server():
     """Bind the HTTP server to the first free port and return it.
 
@@ -328,6 +378,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self._origin_ok():
             self._plain(403, 'forbidden')
             return
+        if self.path == '/dirsize':
+            # folder sizes WITHOUT going through the Stash GraphQL queue
+            # (each GraphQL op spawns a PowerShell -- that starved everything)
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                data = json.loads(self.rfile.read(length))
+                res = _dirsize_batch(list(data.get('paths') or []))
+            except Exception as ex:
+                _log('dirsize failed: %r' % ex)
+                res = {'sizes': {}}
+            self._plain(200, json.dumps(res), 'application/json')
+            return
+
         if self.path != '/execute':
             self._plain(404, 'not found')
             return
