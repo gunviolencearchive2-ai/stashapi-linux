@@ -23,6 +23,7 @@ import tempfile
 
 IS_WIN = os.name == 'nt'
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+PLUGIN_ID = os.path.basename(PLUGIN_DIR)
 PORT_FILE = os.path.join(PLUGIN_DIR, '.server_port')
 LOG_FILE = os.path.join(PLUGIN_DIR, '.server_debug.log')
 
@@ -356,28 +357,27 @@ def screenshot_reply():
 _thumb_sema = threading.Semaphore(2)  # COM thumbnail work is expensive
 
 
-def shell_thumbnail_png(path, size=256):
-    """Windows Explorer thumbnail via IShellItemImageFactory (system COM call).
-    Works for images AND videos. Returns PNG bytes or None.
-    Disk-cached by path+mtime; COM generation capped at 2 parallel calls."""
+def thumb_cache_path(path, size=256):
+    """Return (cache_file_path, key) for a thumbnail, generating it if needed.
+
+    The cache file lives under assets/_cache/thumbs/, which Stash itself serves
+    at /plugin/<id>/assets/_cache/thumbs/ — same-origin, CSP-friendly.
+    """
     if not os.path.isfile(path):
-        return None
+        return None, None
     import hashlib
     try:
         mtime = os.path.getmtime(path)
     except OSError:
-        return None
+        return None, None
     key = hashlib.md5(('%s|%d|%d' % (path.lower(), mtime, size))
                       .encode('utf-8', 'replace')).hexdigest()
     cache_dir = os.path.join(CACHE_DIR, 'thumbs')
     cache_file = os.path.join(cache_dir, key + '.png')
-    try:
-        with open(cache_file, 'rb') as f:
-            return f.read()
-    except OSError:
-        pass
+    if os.path.isfile(cache_file):
+        return cache_file, key
     if not IS_WIN:
-        return None
+        return None, key
     with _thumb_sema:
         try:
             import ctypes
@@ -448,6 +448,7 @@ def shell_thumbnail_png(path, size=256):
                         os.makedirs(cache_dir, exist_ok=True)
                         with open(cache_file, 'wb') as f:
                             f.write(png)
+                        return cache_file, key
                         names = os.listdir(cache_dir)
                         if len(names) > 1000:  # cap cache growth
                             for n in sorted(names)[:200]:
@@ -464,6 +465,19 @@ def shell_thumbnail_png(path, size=256):
             import traceback
             _log('thumbnail failed: %s' % traceback.format_exc())
             return None
+    return None, key
+
+
+def shell_thumbnail_png(path, size=256):
+    """PNG bytes of the Explorer thumbnail (or None)."""
+    cache_file, _key = thumb_cache_path(path, size)
+    if not cache_file:
+        return None
+    try:
+        with open(cache_file, 'rb') as f:
+            return f.read()
+    except OSError:
+        return None
 
 
 # -------------------------------------------------------- media: status ----
@@ -713,15 +727,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if p.startswith('/thumb'):
             path = (self._qs().get('path') or [''])[0]
+            origin = (self._qs().get('origin') or [''])[0].rstrip('/')
             if path and os.path.isfile(path):
-                png = shell_thumbnail_png(path)
-                if png:
-                    self._send_bytes(200, 'image/png', png)
+                cache_file, key = thumb_cache_path(path)
+                if cache_file and origin:
+                    # same-origin URL served by Stash itself — no CSP issues
+                    self.send_response(302)
+                    self.send_header('Location', '%s/plugin/%s/assets/_cache/thumbs/%s.png'
+                                     % (origin, PLUGIN_ID, key))
+                    self.send_header('Content-Length', '0')
+                    self._cors()
+                    self.end_headers()
                     return
-                ext = os.path.splitext(path)[1].lower()
-                if ext in ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.ico', '.avif'):
-                    # no shell thumbnail — let the browser scale the original
-                    self._serve_file(path)
+                if cache_file:
+                    self._send_bytes(200, 'image/png', open(cache_file, 'rb').read())
                     return
             self._plain(404, 'no thumbnail')
             return
