@@ -232,12 +232,18 @@ function fillDirSizes() {
     const paths = batch.map(function (s) { return s.dataset.p; });
     try {
       // via the local server: a GraphQL op spawns a PowerShell and starves
-      // the whole Stash operation queue (that lagged everything)
-      const res = (SRV
-        ? await (await fetch(SRV + '/dirsize', { method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ paths: paths }) })).json()
-        : await op({ action: 'dirsize', paths: paths }));
+      // the whole Stash operation queue (that lagged everything).
+      // If the browser cannot reach the server (remote Stash), fall back
+      // to the GraphQL path -- sizes are worth the slower route.
+      let res = null;
+      if (SRV) {
+        try {
+          res = await (await fetch(SRV + '/dirsize', { method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ paths: paths }) })).json();
+        } catch (e) { res = null; }
+      }
+      if (!res) res = await op({ action: 'dirsize', paths: paths });
       const sizes = (res && res.sizes) || {};
       if (tok !== dsToken) return;
       batch.forEach(function (s) {
