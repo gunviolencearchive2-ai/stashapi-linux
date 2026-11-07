@@ -359,6 +359,15 @@ def act_exec():
 
     res = {'out': smart_decode(o), 'err': smart_decode(e),
            'code': proc.returncode, 'cwd': cwd}
+    # cap huge output: a multi-MB command result travels inside the GraphQL
+    # response and can OOM/503 the Stash server under load
+    MAX_OUT, MAX_ERR = 512 * 1024, 64 * 1024
+    if len(res['out']) > MAX_OUT:
+        res['out'] = res['out'][:MAX_OUT] + (
+            '\n[... вывод обрезан: всего %d байт — сузь команду или сохрани в файл]'
+            % len(res['out']))
+    if len(res['err']) > MAX_ERR:
+        res['err'] = res['err'][:MAX_ERR] + '\n[... stderr обрезан]'
     if timed_out:
         res['err'] += '\n[прервано по таймауту %gs]' % timeout
     return res
