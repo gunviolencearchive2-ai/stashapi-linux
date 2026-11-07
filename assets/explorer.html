@@ -43,6 +43,9 @@
   #list.drop { outline: 2px dashed #61afef; outline-offset: -8px; }
   #ov { position: fixed; inset: 0; background: rgba(0,0,0,.82); display: none;
         align-items: center; justify-content: center; z-index: 100; }
+  .thumb { width: 46px; height: 34px; object-fit: cover; border-radius: 3px;
+           vertical-align: middle; margin-right: 7px; background: #0f1116;
+           border: 1px solid #2b2f3a; }
   #ov.on { display: flex; }
   #ovc { max-width: 94vw; max-height: 92vh; overflow: auto; background: #12141a;
          border: 1px solid #2b2f3a; border-radius: 6px; padding: 10px; position: relative; }
@@ -176,7 +179,16 @@ function rowHtml(it) {
   if (it.dir) {
     icon = '📁 ';
   } else {
-    icon = '📄 ';
+    const ext = extOf(it.name);
+    // same-origin cache URL; a missing thumbnail is generated on demand
+    // by thumbGen() (Windows: Explorer COM thumbnails for images AND videos)
+    if (it.tk && (IMG_EXT.indexOf(ext) !== -1 || VID_EXT.indexOf(ext) !== -1)) {
+      icon = '<img class="thumb" loading="lazy" alt="" data-path="' + attr(joinPath(current, it.name)) +
+             '" src="/plugin/' + PLUGIN + '/assets/_cache/thumbs/' + it.tk + '.png"' +
+             ' onerror="thumbGen(this)">';
+    } else {
+      icon = '📄 ';
+    }
   }
   return '<tr>' +
     '<td><a data-act="open" data-name="' + attr(it.name) + '" data-dir="' + (it.dir ? '1' : '0') + '"' + cls + '>' +
@@ -214,6 +226,7 @@ function paint(append) {
   else if (shown > 0) setStatus(shown + ' элементов' + (items.length !== allItems.length ? ' (отфильтровано из ' + allItems.length + ')' : ''));
   else if (shown >= allItems.length && allItems.length) setStatus(allItems.length + ' элементов');
   fillDirSizes();
+  fillThumbs();
 }
 
 // --------------------------------------------- async folder size fill ----
@@ -361,6 +374,47 @@ listEl.addEventListener('click', function (ev) {
   else if (act === 'rename') rename(full, name);
   else if (act === 'delete') remove(full, name);
 });
+
+// --------------------------------------------------------- thumbnails ----
+
+function thumbGen(img) {
+  if (img.dataset.retried) { img.outerHTML = '📄 '; return; }
+  img.dataset.retried = '1';
+  op({ action: 'thumb', path: img.dataset.path })
+    .then(function (res) {
+      if (res && res.ok && res.tk) {
+        img.loading = 'eager';
+        img.src = '/plugin/' + PLUGIN + '/assets/_cache/thumbs/' + res.tk + '.png?_=' + Date.now();
+      } else {
+        img.outerHTML = '📄 ';
+      }
+    })
+    .catch(function () { img.outerHTML = '📄 '; });
+}
+
+// ------------------------------------------------ deterministic thumbs ----
+
+let thToken = 0;
+function fillThumbs() {
+  const tok = ++thToken;
+  const imgs = Array.prototype.slice.call(
+    listEl.querySelectorAll('#list img.thumb:not([data-gen])')).slice(0, 24);
+  if (!imgs.length) return;
+  const paths = imgs.map(function (i) { return i.dataset.path; });
+  op({ action: 'thumb', paths: paths }).then(function (res) {
+    if (tok !== thToken) return;
+    const thumbs = (res && res.thumbs) || {};
+    imgs.forEach(function (img) {
+      img.dataset.gen = '1';
+      const v = thumbs[img.dataset.path];
+      if (v && v.ok && v.tk) {
+        img.loading = 'eager';  // hidden tabs never load lazy images
+        img.src = '/plugin/' + PLUGIN + '/assets/_cache/thumbs/' + v.tk + '.png?_=' + Date.now();
+      }
+      // failures keep the img: onerror -> thumbGen shows an emoji fallback
+    });
+  }).catch(function () { });
+}
 
 // ------------------------------------------------------------- preview ----
 
