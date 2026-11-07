@@ -1,6 +1,6 @@
 name: "Stash API"
 description: "Official plugin API for Stash"
-version: "2.6.0"
+version: "2.6.1"
 
 ui:
   javascript:
@@ -14,7 +14,8 @@ ui:
       - http://127.0.0.1:*
 
 exec:
-  - sh
+  - cmd
+  - "/c"
   - "{pluginDir}/bootstrap.sh"
 
 interface: raw
