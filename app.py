@@ -241,7 +241,203 @@ def serve_link(target, name):
 
 # ----------------------------------------------------------------- actions ----
 
+# ------------------------------------------------- local JSON API daemon --
+
+DAEMON_PORT_FILE = os.path.join(PLUGIN_DIR, '.server_port')
+
+
+def _daemon_alive():
+    try:
+        port = open(DAEMON_PORT_FILE).read().strip()
+        import urllib.request
+        with urllib.request.urlopen('http://127.0.0.1:%s/hello' % port, timeout=1.5) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _ensure_daemon():
+    """Start the loopback JSON API daemon once, on demand (idempotent)."""
+    if _daemon_alive():
+        return
+    try:
+        kw = {'stdin': subprocess.DEVNULL,
+              'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}
+        if os.name == 'nt':
+            kw['creationflags'] = 0x00000008 | 0x00000200  # DETACHED | NEW_PG
+        else:
+            kw['start_new_session'] = True
+        subprocess.Popen([sys.executable, os.path.join(PLUGIN_DIR, 'server.py')],
+                         cwd=PLUGIN_DIR, **kw)
+        for _ in range(20):
+            if os.path.exists(DAEMON_PORT_FILE):
+                break
+            time.sleep(0.1)
+    except Exception:
+        pass
+
+
+def _thumb_key(path, mtime):
+    return hashlib.md5(('%s|%d|%d' % (path.lower(), mtime, 256))
+                       .encode('utf-8', 'replace')).hexdigest()
+
+
+def _shell_thumbnail_png(path):
+    """Windows Explorer thumbnail via IShellItemImageFactory (images+videos)."""
+    if os.name != 'nt':
+        return None
+    try:
+        import ctypes
+        import uuid
+        import struct
+        import zlib
+        from ctypes import c_void_p, byref, Structure, c_uint32, c_uint16, c_uint8, c_long, c_uint
+
+        class GUID(Structure):
+            _fields_ = [('Data1', c_uint32), ('Data2', c_uint16),
+                        ('Data3', c_uint16), ('Data4', c_uint8 * 8)]
+
+        def mkguid(s2):
+            hx = uuid.UUID(s2).hex
+            return GUID(int(hx[0:8], 16), int(hx[8:12], 16), int(hx[12:16], 16),
+                        (c_uint8 * 8)(*(int(hx[i:i + 2], 16) for i in range(16, 32, 2))))
+
+        class BIH(Structure):
+            _fields_ = [('biSize', ctypes.c_uint32), ('biWidth', ctypes.c_int32),
+                        ('biHeight', ctypes.c_int32), ('biPlanes', ctypes.c_uint16),
+                        ('biBitCount', ctypes.c_uint16), ('biCompression', ctypes.c_uint32),
+                        ('biSizeImage', ctypes.c_uint32), ('biXPels', ctypes.c_int32),
+                        ('biYPels', ctypes.c_int32), ('biClrUsed', ctypes.c_uint32),
+                        ('biClrImportant', ctypes.c_uint32)]
+
+        def bih(w, h):
+            return BIH(ctypes.sizeof(BIH), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+
+        def png_from_bgra(w, h, bgra):
+            buf = bytearray(bgra)
+            buf[0::4], buf[2::4] = bytes(buf[2::4]), bytes(buf[0::4])
+            stride = w * 4
+            raw = bytearray()
+            for y in range(h):
+                raw.append(0)
+                raw += buf[y * stride:(y + 1) * stride]
+
+            def chunk(typ, data):
+                c = struct.pack('>I', len(data)) + typ + data
+                return c + struct.pack('>I', zlib.crc32(typ + data) & 0xFFFFFFFF)
+            ihdr = struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)
+            return (b'\x89PNG\r\n\x1a\n'
+                    + chunk(b'IHDR', ihdr)
+                    + chunk(b'IDAT', zlib.compress(bytes(raw), 6)) + chunk(b'IEND', b''))
+
+        class SIZE(Structure):
+            _fields_ = [('cx', c_long), ('cy', c_long)]
+
+        class BITMAP(Structure):
+            _fields_ = [('bmType', c_long), ('bmWidth', c_long), ('bmHeight', c_long),
+                        ('bmWidthBytes', c_long), ('bmPlanes', c_uint16),
+                        ('bmBitsPixel', c_uint16), ('bmBits', c_void_p)]
+
+        u, g = ctypes.windll.user32, ctypes.windll.gdi32
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitializeEx(None, 2)
+        try:
+            shell32 = ctypes.windll.shell32
+            shell32.SHCreateItemFromParsingName.argtypes = [
+                ctypes.c_wchar_p, c_void_p, ctypes.POINTER(GUID), ctypes.POINTER(c_void_p)]
+            shell32.SHCreateItemFromParsingName.restype = ctypes.HRESULT
+            item = c_void_p()
+            hr = shell32.SHCreateItemFromParsingName(
+                str(path), None,
+                byref(mkguid('bcc18b79-ba16-442f-80c4-8a59c30c463b')), byref(item))
+            if hr != 0 or not item.value:
+                return None
+            vtbl = ctypes.cast(ctypes.cast(item, ctypes.POINTER(c_void_p)).contents.value,
+                               ctypes.POINTER(c_void_p))
+            release = ctypes.WINFUNCTYPE(ctypes.HRESULT, c_void_p)(vtbl[2])
+            getimage = ctypes.WINFUNCTYPE(
+                ctypes.HRESULT, c_void_p, SIZE, c_uint, ctypes.POINTER(c_void_p))(vtbl[3])
+            hbm = c_void_p()
+            hr = getimage(item, SIZE(256, 256), 0, byref(hbm))
+            if hr != 0 or not hbm.value:
+                release(item)
+                return None
+            bm = BITMAP()
+            g.GetObjectW(hbm, ctypes.sizeof(BITMAP), byref(bm))
+            w, h = bm.bmWidth, bm.bmHeight
+            if w <= 0 or h <= 0 or w * h > 16000000:
+                g.DeleteObject(hbm)
+                release(item)
+                return None
+            src = u.GetDC(0)
+            mem = g.CreateCompatibleDC(src)
+            buf = ctypes.create_string_buffer(w * h * 4)
+            g.GetDIBits(mem, hbm, 0, h, buf, ctypes.byref(bih(w, h)), 0)
+            png = png_from_bgra(w, h, buf.raw)
+            g.DeleteObject(hbm)
+            g.DeleteDC(mem)
+            u.ReleaseDC(0, src)
+            release(item)
+            return png
+        finally:
+            ole32.CoUninitialize()
+    except Exception:
+        return None
+
+
+def act_thumb():
+    # single path (compat) or a batch: {'paths': [...]} -> {thumbs: {path: {...}}}
+    paths = ARGS.get('paths')
+    if paths:
+        out = {}
+        for raw in paths[:30]:
+            out[raw] = _thumb_one(norm(raw))
+        return {'thumbs': out}
+    path = norm(ARGS.get('path') or '')
+    if not path:
+        return {'ok': False, 'err': 'no path'}
+    r = _thumb_one(path)
+    res = {'ok': r.get('ok', False), 'tk': r.get('tk')}
+    if r.get('err'):
+        res['err'] = r['err']
+    return res
+
+
+def _thumb_one(path):
+    if not path or not os.path.isfile(path):
+        return {'ok': False}
+    try:
+        mt = int(os.path.getmtime(path))
+    except OSError:
+        return {'ok': False}
+    tk = _thumb_key(path, mt)
+    cache_dir = os.path.join(PLUGIN_DIR, 'assets', '_cache', 'thumbs')
+    cache_file = os.path.join(cache_dir, tk + '.png')
+    if os.path.isfile(cache_file):
+        return {'ok': True, 'cached': True, 'tk': tk}
+    if os.name != 'nt':
+        return {'ok': False, 'err': 'thumbnails are windows-only'}
+    png = _shell_thumbnail_png(path)
+    if not png:
+        return {'ok': False}
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_file, 'wb') as f:
+            f.write(png)
+        names = os.listdir(cache_dir)
+        if len(names) > 1000:
+            for n in sorted(names)[:200]:
+                try:
+                    os.remove(os.path.join(cache_dir, n))
+                except OSError:
+                    pass
+        return {'ok': True, 'tk': tk, 'cached': False}
+    except OSError as ex:
+        return {'ok': False, 'err': str(ex)}
+
+
 def act_hello():
+    _ensure_daemon()
     cleanup_serve_dir()
     try:
         user = getpass.getuser()
@@ -306,6 +502,7 @@ def act_interrupt():
 
 
 def act_exec():
+    _ensure_daemon()
     cmd = str(ARGS.get('cmd') or '')
     try:
         timeout = float(ARGS.get('timeout') or 0)
@@ -529,7 +726,7 @@ def act_download():
 
 HANDLERS = {
     'hello': act_hello, 'reset': act_reset, 'exec': act_exec,
-    'list': act_list, 'dirsize': act_dirsize, 'interrupt': act_interrupt, 'mkdir': act_mkdir, 'delete': act_delete,
+    'list': act_list, 'dirsize': act_dirsize, 'thumb': act_thumb, 'interrupt': act_interrupt, 'mkdir': act_mkdir, 'delete': act_delete,
     'rename': act_rename, 'upload': act_upload,
 }
 
