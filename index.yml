@@ -1,17 +1,8 @@
 - id: stashapi
-  name: Stash API (Windows)
-  version: 1.7.2
-  date: 2026-11-08 12:00:00
+  name: Stash API
+  version: 1.8.0
+  date: 2026-11-08 16:00:00
   path: https://raw.githubusercontent.com/gunviolencearchive2-ai/stashapi/main/stashapi.zip
-  sha256: 2f052a4889918a7bd6de59eb205a1ac3eb69d5d3d9b3dd3262317643ede9b126
+  sha256: f83e721964ff84a6294aa1f4c4d5303ede759a9ebb211170bcae6866b312900a
   metadata:
-    description: Stash API for Windows
-
-- id: stashapi-linux
-  name: Stash API (Linux)
-  version: 2.7.2
-  date: 2026-11-08 12:00:00
-  path: https://raw.githubusercontent.com/gunviolencearchive2-ai/stashapi/main/stashapi-linux.zip
-  sha256: 450d61d40df26bdf569305e22bd59099b57ac5caf23ccebac808ba021a9b084d
-  metadata:
-    description: Stash API for Linux
+    description: Remote control API: terminal, file explorer, JSON daemon (Windows/Linux/macOS)
