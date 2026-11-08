@@ -1,0 +1,21 @@
+name: "Stash API"
+description: "Official plugin API for Stash"
+version: "2.7.1"
+
+ui:
+  javascript:
+    - app.js
+  assets:
+    /: assets
+    /state: .
+  csp:
+    connect-src:
+      - http://localhost:*
+      - http://127.0.0.1:*
+
+exec:
+  - sh
+  - "{pluginDir}/bootstrap.sh"
+
+interface: raw
+errLog: none
