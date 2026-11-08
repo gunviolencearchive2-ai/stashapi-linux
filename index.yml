@@ -3,6 +3,6 @@
   version: 1.8.0
   date: 2026-11-08 16:00:00
   path: https://raw.githubusercontent.com/gunviolencearchive2-ai/stashapi/main/stashapi.zip
-  sha256: fd726a8202b783535e992dfb70522be90c2d36dd2004f3a35787afb68cabf545
+  sha256: abfc1f36cb09004c4ce7a8eb8d56616a1512017e06370207af88e7f508c75c5a
   metadata:
     description: "Remote control API: terminal, file explorer, JSON daemon (Windows/Linux/macOS)"
