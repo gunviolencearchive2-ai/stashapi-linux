@@ -1,8 +1,8 @@
 - id: stashapi
   name: Stash API
-  version: 1.8.3
-  date: 2026-11-09 19:25:00
+  version: 1.8.4
+  date: 2026-11-10 20:09:50
   path: https://raw.githubusercontent.com/gunviolencearchive2-ai/stashapi/main/stashapi.zip
-  sha256: 94203046a22ff32e00a2e85abb85264e914062c7ba94653f6dce22ae55c7ce45
+  sha256: 4b1d0deaef69139024df1d2c93d7d1635db02488b01101c26b40f94e63a51602
   metadata:
     description: "Plugin API"
